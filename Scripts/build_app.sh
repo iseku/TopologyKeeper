@@ -66,8 +66,13 @@ codesign --verify --verbose=2 "$APP" 2>&1 | sed 's/^/    /'
 echo "==> 4/5 打包 dmg"
 VERSION="$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" "$APP/Contents/Info.plist" 2>/dev/null || echo "0.0.0")"
 DMG="$DIST/$APP_NAME-$VERSION.dmg"
-rm -f "$DMG"
-hdiutil create -volname "$APP_NAME" -srcfolder "$APP" -ov -format UDZO "$DMG" >/dev/null
+STAGE="$TK_ROOT/.build/dmg-staging"
+rm -rf "$STAGE" "$DMG"
+mkdir -p "$STAGE"
+cp -R "$APP" "$STAGE/"
+ln -s /Applications "$STAGE/Applications"
+hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
+rm -rf "$STAGE"
 echo "    $DMG"
 
 echo "==> 5/5 完成"
