@@ -58,6 +58,26 @@ jobs:
       - name: 运行单元测试
         run: swift test
 
+      # 本 workflow 的定义取自默认分支，但 checkout 的是 tag 指向的代码，两者可能错位。
+      # 若 tag 早于通用构建支持（例如指向首次发布的提交），build_app.sh 会把
+      # `--universal` 当成未知参数直接 exit 1 —— 表现为「0 秒失败」且毫无线索。
+      # 这里提前失败并说清原因。
+      - name: 检查该 tag 的代码是否支持通用构建
+        run: |
+          set -euo pipefail
+          hint="该 tag 早于通用构建支持。请改用指向当前 main 的 tag，或把该 tag 移到最新提交后重新发布。"
+          for f in Scripts/build_app.sh Scripts/verify_app.sh; do
+            if [[ ! -f "$f" ]]; then
+              echo "::error::tag $TAG 中不存在 $f —— $hint"
+              exit 1
+            fi
+          done
+          if ! grep -q -- '--universal' Scripts/build_app.sh; then
+            echo "::error::tag $TAG 的 Scripts/build_app.sh 不支持 --universal —— $hint"
+            exit 1
+          fi
+          echo "OK：$TAG 的构建脚本支持通用二进制"
+
       - name: 构建通用 App 并打包 dmg
         run: Scripts/build_app.sh --universal
 
@@ -72,6 +92,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          gh release upload "$TAG" Dist/TopologyKeeper.dmg --clobber
-          echo "已上传到 $TAG："
-          gh release view "$TAG" --json assets --jq '.assets[] | "\(.name)  \(.size) bytes"'
+          # 与 Scripts/env.sh 里同样的保护，原因见那段注释：
+          # 变量后若紧跟中文标点（如「：」），bash 会把多字节标点的一部分并进变量名，
+          # 配合 set -u 直接报 "TAG<乱码>: unbound variable"。
+          # 这里钉住 locale，并且**一律写成 ${VAR} 花括号形式**（下面的 ${TAG}）。
+          export LC_ALL=C
+          gh release upload "${TAG}" Dist/TopologyKeeper.dmg --clobber
+          echo "已上传到 ${TAG}"
+          gh release view "${TAG}" --json assets --jq '.assets[] | "\(.name)  \(.size) bytes"'

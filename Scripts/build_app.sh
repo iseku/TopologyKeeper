@@ -104,22 +104,23 @@ echo "==> 4/5 打包 dmg"
 # dmg 固定命名（不带版本号），配合 GitHub /releases/latest/download 永久链接，
 # README 无需随版本更新；版本信息由 Release 的 tag 承载
 #
-# 这里不用 `hdiutil create -srcfolder`：那个形式要先把一块可写临时镜像挂载起来，
-# 再往挂载点里拷文件。因此在挂载受限的环境（受限沙箱、部分 CI/容器，或用户当前
-# 正挂着同卷名的旧 dmg）会直接失败，并且报出误导性的 "create failed - 目录非空"。
-# 改用 makehybrid：它直接由目录构建文件系统、不挂载任何卷，再 convert 成压缩格式。
-# 产物结构（卷名、/Applications 符号链接、文件权限）与原方式一致。
+# 必须用 `hdiutil create -srcfolder`，**不要**换成 `hdiutil makehybrid`。
+# makehybrid 会给镜像里的每个条目写入 FinderInfo，挂载后还原成
+# com.apple.FinderInfo 扩展属性，于是 dmg 里的 App 通不过
+# `codesign --verify --deep --strict`。注意打包前的 Dist/ 目录是干净的，
+# 这个污染只有在挂载点上才查得出来（Scripts/verify_app.sh 会拦住它）。
+#
+# 该形式需要挂载一块可写临时镜像，所以在挂载受限的环境（受限沙箱、部分容器）
+# 会失败，并报出误导性的 "create failed - 目录非空"。遇到就换到不受限的环境构建，
+# 不要为了绕开它改回 makehybrid。
 DMG="$DIST/$APP_NAME.dmg"
 STAGE="$TK_ROOT/.build/dmg-staging"
-RAW="$TK_ROOT/.build/dmg-raw.dmg"
-rm -rf "$STAGE"
-rm -f "$DMG" "$RAW"
+rm -rf "$STAGE" "$DMG"
 mkdir -p "$STAGE"
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
-hdiutil makehybrid -hfs -hfs-volume-name "$APP_NAME" -o "$RAW" "$STAGE" >/dev/null
-hdiutil convert "$RAW" -format UDZO -o "$DMG" >/dev/null
-rm -rf "$STAGE" "$RAW"
+hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
+rm -rf "$STAGE"
 echo "    $DMG"
 
 echo "==> 5/5 完成"

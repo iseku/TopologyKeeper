@@ -52,6 +52,21 @@ ls -la "$MOUNT" | sed 's/^/    /'
 [[ -L "$MOUNT/Applications" ]] || fail "dmg 内缺少 /Applications 拖放快捷方式"
 [[ -d "$MOUNT/$APP_NAME.app" ]] || fail "dmg 内缺少 $APP_NAME.app"
 
+# 必须复查**挂载后**的 App，而不是只查打包前的 Dist/。
+# 打包方式会给镜像里的每个条目带上 FinderInfo 之类的 detritus，这类污染
+# 只在挂载后才显现（打包前的目录是完全干净的），会让 --strict 校验失败。
+# 我们曾用 `hdiutil makehybrid` 出包时踩到过，因此这里作为硬性门槛。
+echo "    --- dmg 内 App 的严格签名校验 ---"
+if ! codesign --verify --deep --strict --verbose=2 "$MOUNT/$APP_NAME.app" 2>&1 | sed 's/^/    /'; then
+    fail "dmg 内的 App 未通过严格签名校验 —— 很可能被打包过程污染（例如带上了 com.apple.FinderInfo）"
+fi
+
+if xattr -lr "$MOUNT/$APP_NAME.app" 2>/dev/null | grep -q .; then
+    echo "    ⚠️  dmg 内 App 带有扩展属性："
+    xattr -lr "$MOUNT/$APP_NAME.app" 2>/dev/null | sed 's/^/      /'
+    fail "dmg 内的 App 不应带扩展属性（detritus）"
+fi
+
 echo
 echo "✅ 产物校验通过"
 ls -l "$DMG" | sed 's/^/    /'
