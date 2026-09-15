@@ -144,8 +144,25 @@ struct PopoverRootView: View {
             chromeHeight = height
             reportLayoutHeight(content: rulesContentHeight, chrome: height)
         }
-        // 兜底：即使上面的计算出现意外，也不让面板超过上限
-        .frame(maxHeight: maxContentHeight)
+        // 兜底：即使上面的计算出现意外，也不让面板超过上限。
+        //
+        // ★ alignment 必须是 `.top` —— 这不是样式偏好，而是**消除"收起日志时
+        //   闪一下"这个真 bug 的关键**（用户实测：内容先在正常位置**下方**出现，
+        //   随后才跳回正常位置；手机录像定格可见两层内容相差约一个日志面板）。
+        //
+        //   机理：`.frame(maxHeight:)` 在"容器比内容高"时按 alignment 摆放内容，
+        //   默认 `.center` 会把内容**垂直居中**。而收起日志的那一瞬间，SwiftUI
+        //   内容已经变矮、NSPopover 窗口却还停在旧的大高度（窗口要等测量回调 +
+        //   `applyPopoverHeight` 里延后的一拍才收缩）⇒ 那一帧里内容被居中，
+        //   整体下移约 (日志面板高 ÷ 2)，窗口随后收缩又把它拉回原位。
+        //   钉成 `.top` 后内容恒贴**菜单栏那一侧**：窗口偏大时只是底部多出空白，
+        //   观感正是"从下方收上去"。
+        //
+        //   注意 AppKit 那一侧是对的、不要去改：`NSPopover` 改 contentSize 时
+        //   **窗口顶边是同步保持的**（`Probe/popover_size_probe` 实测 Δtop = 0）；
+        //   手动 `setFrameOrigin` 反而会引入 26pt 偏差。
+        //   实测对照见 `Probe/popover_center_probe`：`.center` 偏移 100pt → `.top` 恒为 0。
+        .frame(maxHeight: maxContentHeight, alignment: .top)
     }
 
     /// 把"面板应有的总高度"报给外层（AppKit 侧设置 `NSPopover.contentSize`）。
