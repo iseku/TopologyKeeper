@@ -19,11 +19,12 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<!-- 发布版本号。注意与**功能阶段**编号（v1/v2/v3）区分：
-	     后者指**功能阶段**，此处是**对外版本号**，两者不是一回事。 -->
+	     后者指**功能阶段**，此处是**对外版本号**，两者不是一回事。
+	     0.1.1：声道处理引擎总开关 + 直通模式（全断/直通/交换/混音四态）。 -->
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.0</string>
+	<string>0.1.1</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>2</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
 	<!-- 菜单栏应用：不出现在 Dock，也不占用 Cmd-Tab -->

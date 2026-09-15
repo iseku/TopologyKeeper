@@ -86,12 +86,16 @@ final class StatusBarController: NSObject {
 
     /// 声道处理的附加提示（仅在启用或有异常时出现）
     ///
-    /// 按**当前生效的功能**取名与取文案：交换与混音共用通路，
-    /// 一律写"声道交换：交换中"会在开混音时误导用户。
+    /// 按**当前生效的模式**取名与取文案：交换与混音共用通路，
+    /// 一律写"声道交换：交换中"会在开混音时误导用户；
+    /// 直通模式下则说"声道处理：直通中"（它没有具体功能名）。
     private var channelProcessingToolTipSuffix: String {
         let diag = appState.swapDiagnostics
         guard diag.state != .disabled else { return "" }
-        return "\n\(diag.activeFunction.displayName)：\(diag.statusText)"
+        let title = diag.activeFunction == .passThrough
+            ? "声道处理"
+            : diag.activeFunction.displayName
+        return "\n\(title)：\(diag.statusText)"
     }
 
     private func observeState() {

@@ -49,10 +49,12 @@ final class AppState: ObservableObject {
             }
         } notify: { [weak self] message in
             // 声道处理穷尽重试后的告警（用户确认：1-2-4-8 秒后仍不成功则提示）
-            // 标题按**当前生效的功能**取名 —— 混音失败时不该说"声道交换未能启动"
+            // 标题按**当前生效的模式**取名 —— 混音失败时不该说"声道交换未能启动"，
+            // 直通（两个功能都关、但引擎开着）失败时同理。
             DispatchQueue.main.async {
                 guard let self else { return }
-                let function = self.config.channelSwap.mixEnabled ? "LFE 混音" : "声道交换"
+                let mode = self.config.channelSwap.processingMode
+                let function = mode == .passThrough ? "声道直通" : mode.displayName
                 self.notifier.post(title: "\(function)未能启动", body: message)
                 self.lastError = message
             }
@@ -269,7 +271,40 @@ final class AppState: ObservableObject {
         swapState = diag.state
     }
 
-    /// 开关总开关
+    // MARK: - 声道处理：引擎总开关（v0.1.1）
+
+    /// 声道处理引擎总开关的当前值（配置态）。
+    var channelProcessingEngineEnabled: Bool { config.channelSwap.engineEnabled }
+
+    /// 本机是否存在 **BlackHole 16ch** 设备。
+    ///
+    /// 为什么开总开关前必须查这一次（用户要求）：引擎的输入侧**只能是 BlackHole**
+    /// —— 它从虚拟设备的缓冲区里读内容，再写到真实播放设备。
+    /// 没有 BlackHole 时打开总开关毫无意义：通路永远起不来，
+    /// 用户看到的会是"已开启 + 一直在等待"，而真正的原因（缺驱动）藏在日志里。
+    /// ⇒ 与其让他自己猜，不如在**打开的那一刻**就明确告诉他去装。
+    ///
+    /// 判据用"名字以 BlackHole 开头 **且** 输出声道数 ≥ 16"而不是死抠字面名字：
+    /// * 驱动可能被改名（`BlackHole 16ch` / `BlackHole 16ch (2)` 等）；
+    /// * 而 16ch 是**能力要求** —— 引擎一次要取 8 条声道，2ch/8ch 版本不够用。
+    func hasBlackHole16chDevice() -> Bool {
+        listOutputDevices().contains {
+            $0.name.hasPrefix("BlackHole") && $0.outputChannelCount >= 16
+        }
+    }
+
+    /// 开关声道处理引擎（本页所有功能的总开关）。
+    ///
+    /// 语义（用户确认）：关闭 = **全断**（通路完全不跑、不占用任何音频设备）；
+    /// 开启 = 通路必须跑，具体跑哪一种由交换/混音的开关决定，两者都关时是**直通**
+    /// （被动进入，用户无法直接选择）。
+    ///
+    /// ⚠️ 调用方（UI）有责任在**开启前**先查 BlackHole：
+    /// 见 `hasBlackHole16chDevice()` 与设置页的提示框。
+    func setChannelProcessingEngineEnabled(_ enabled: Bool) {
+        updateConfig { $0.channelSwap.engineEnabled = enabled }
+    }
+
     /// 开关声道交换。
     ///
     /// ⚠️ 与「LFE 混音」**互斥**（用户确认）：两者对应不同的音响条件 ——

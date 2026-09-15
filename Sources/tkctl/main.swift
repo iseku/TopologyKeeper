@@ -543,6 +543,7 @@ func cmdAgent(_ args: [String]) {
 ///   tkctl swap show             显示当前配置与引擎状态
 ///   tkctl swap run [秒数]       前台跑一次交换（会真正占用设备）
 ///   tkctl swap enable/disable   写配置开关（App 下次读取生效）
+///   tkctl swap engine on/off    写**声道处理引擎总开关**（v0.1.1）
 func cmdSwap(_ args: [String]) {
     let sub = args.first ?? "show"
     switch sub {
@@ -551,6 +552,7 @@ func cmdSwap(_ args: [String]) {
     case "run":     swapRun(seconds: args.count >= 2 ? (Double(args[1]) ?? 5) : 5)
     case "enable":  swapSetEnabled(true)
     case "disable": swapSetEnabled(false)
+    case "engine":  swapEngine(args.count >= 2 ? args[1] : "show")
     case "selftest":
         var secs = 8.0
         var pair: (Int, Int)? = nil
@@ -576,6 +578,9 @@ func cmdSwap(_ args: [String]) {
                             自测：用**生产版驱动**播逐段序列并交换（不需要外部音频源）
                             例：tkctl swap selftest 20 --swap 1,2   （左右互换，最易判定）
           enable / disable  改写配置开关
+          engine on/off     改写「声道处理引擎」总开关（本页所有功能的电源）
+                            · 关闭 = 全断（通路完全不跑，不占用音频设备）
+                            · 开启 = 按交换/混音开关装配；两者都关则为「直通」
         """)
     }
 }
@@ -623,6 +628,12 @@ private func swapShow() {
     let config = appConfigStore().config
     let s = config.channelSwap
     print("\n声道交换配置")
+    // ★ 总开关与当前模式放在最前：它们决定"下面这些开关到底生不生效"。
+    //   先前这里只印功能开关，于是"引擎关着、交换写着启用"看起来像在生效 ——
+    //   实际通路根本没跑（用户称之为「全断」）。
+    print("  引擎总开关:  \(s.engineEnabled ? "启用" : "停用")"
+          + (s.engineEnabled ? "" : "   ← 全断：通路不跑，下面的功能开关都不生效"))
+    print("  当前模式:    \(s.processingMode.shortName)（\(s.processingMode.modeSummary)）")
     print("  开关:        \(s.isEnabled ? "启用" : "停用")")
     print("  交换声道:    \(s.swapDescription)   ← 对外 1-based")
     print("  输入设备:    \(s.inputDeviceUID ?? "自动（第一个 BlackHole）")")
@@ -661,6 +672,11 @@ private func mixShow() {
     let config = appConfigStore().config
     let s = config.channelSwap
     print("\nLFE 混音配置")
+    // ★ 与 `swap show` 对称：先报总开关与当前模式，否则"混音写着启用"
+    //   会被误读成"正在混音"（引擎关着时它其实完全不生效）。
+    print("  引擎总开关:  \(s.engineEnabled ? "启用" : "停用")"
+          + (s.engineEnabled ? "" : "   ← 全断：通路不跑，本功能不生效"))
+    print("  当前模式:    \(s.processingMode.shortName)（\(s.processingMode.modeSummary)）")
     print("  开关:        \(s.mixEnabled ? "启用" : "停用")")
     let db = s.mixGainDB
     let gain = LfeMixPlan.gain(fromDB: db)
@@ -711,7 +727,17 @@ private func mixShow() {
     // 混音没开时不必解析计划：直接说清楚"当前用的是什么"，
     // 免得把内部的"不可用"哨兵当成技术错误暴露出去。
     guard s.mixEnabled else {
-        print("  * 实际混音:  未启用（当前使用：\(effectiveSwap != nil ? "声道交换" : "两者都未启用")）")
+        // ★ "两者都未启用"要分成两种**完全不同**的态（v0.1.1）：
+        //   引擎开着 ⇒ 直通（音频照常在转发，只是不处理）；
+        //   引擎关着 ⇒ 全断（通路不跑，音频根本不经由本工具）。
+        //   先前一律写"两者都未启用"，恰好掩盖了"没声音"的真正原因。
+        let current: String
+        if effectiveSwap != nil {
+            current = "声道交换"
+        } else {
+            current = s.engineEnabled ? "直通（原样转发）" : "全断（通路未运行）"
+        }
+        print("  * 实际混音:  未启用（当前使用：\(current)）")
         print("")
         print("提示：引擎状态只在 App 进程内可得；本命令显示的是持久化配置与解析结果。")
         print("")
@@ -766,7 +792,19 @@ private func mixSetEnabled(_ enabled: Bool) {
     }
     if turnedOffSwap { print("（已自动关闭「声道交换」—— 两者互斥）") }
     print("已\(enabled ? "启用" : "停用")LFE 混音（App 会在配置变更后自动重新应用）")
+    warnIfEngineDisabled()
     notifyAppToReload()
+}
+
+/// 引擎总开关没开时提醒一句。
+///
+/// 必要性（0.1.1）：总开关关闭 = 全断，此时**功能开关写着"启用"也完全不生效**。
+/// 不提醒的话，用户看到"混音已启用"却毫无效果，会一路怀疑到驱动层去 ——
+/// 这正是"全断"那种态最迷惑人的地方。
+private func warnIfEngineDisabled() {
+    guard !appConfigStore().config.channelSwap.engineEnabled else { return }
+    print("  [注意] 声道处理引擎总开关当前是「关闭」（全断），本开关暂时不生效。")
+    print("         需要生效请执行 `tkctl swap engine on`。")
 }
 
 private func mixSetGain(_ db: Double) {
@@ -1022,6 +1060,40 @@ private func swapSetEnabled(_ enabled: Bool) {
     }
     if turnedOffMix { print("（已自动关闭「LFE 混音」—— 两者互斥）") }
     print("已\(enabled ? "启用" : "停用")声道交换（App 会在配置变更后自动重新应用）")
+    warnIfEngineDisabled()
+    notifyAppToReload()
+}
+
+/// `tkctl swap engine on|off|show`：**声道处理引擎总开关**（v0.1.1 新增）。
+///
+/// 为什么 CLI 也要能改：排查"突然没声音"时它是第一现场 ——
+/// 「全断」与「直通」的差别只看功能开关是看不出来的
+/// （两种情形下交换/混音可能都写着"停用"）。
+private func swapEngine(_ value: String) {
+    let store = appConfigStore()
+    switch value {
+    case "on", "enable", "true":
+        store.update { $0.channelSwap.engineEnabled = true }
+        let s = store.config.channelSwap
+        print("已启用声道处理引擎（当前模式：\(s.processingMode.shortName)）")
+        print("  App 会自动重新装配通路；输入/输出设备不满足条件时按 "
+              + "\(s.backoffDescription) 重试，穷尽后告警。")
+    case "off", "disable", "false":
+        store.update { $0.channelSwap.engineEnabled = false }
+        print("已停用声道处理引擎 —— 全断：通路不再运行，不占用任何音频设备。")
+        print("  [注意] 若系统默认输出仍指向 BlackHole，此时不会有任何声音。")
+    default:
+        let s = store.config.channelSwap
+        print("\n声道处理引擎（总开关）")
+        print("  状态:        \(s.engineEnabled ? "启用" : "停用")")
+        print("  当前模式:    \(s.processingMode.shortName)（\(s.processingMode.modeSummary)）")
+        print("  交换 / 混音: \(s.isEnabled ? "开" : "关") / \(s.mixEnabled ? "开" : "关")")
+        print("")
+        print("提示：模式由总开关与两个功能开关共同决定 ——")
+        print("      总开关关 → 全断；开 + 都不开 → 直通（原样转发）；开 + 其一 → 交换 / 混音。")
+        print("")
+        return
+    }
     notifyAppToReload()
 }
 

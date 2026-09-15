@@ -48,17 +48,24 @@ enum EvaluationOrigin: Hashable, CustomStringConvertible {
 /// ## 状态流转
 ///
 /// ```
-/// disabled ──apply(enabled:false)──▶ disabled
+/// disabled ──apply(engineEnabled:false)──▶ disabled        （全断：通路不跑）
 ///    │
-///    └─apply(enabled:true)─▶ 解析设备
+///    └─apply(engineEnabled:true)─▶ 解析设备                   （通路判据 = 总开关）
 ///                              ├─ 不满足 ─▶ waiting(attempt:n, next:backoff[n])
 ///                              │                │ 回退计时到点
 ///                              │                ├─ 仍不满足且序列未穷尽 ─▶ waiting(n+1)
 ///                              │                └─ 序列穷尽 ─▶ gaveUp ─(告警)
-///                              └─ 满足 ─▶ 启动音频通路 ─▶ running
+///                              └─ 满足 ─▶ 按模式装配 ─▶ running
+///                                          · 交换开 → 置换两个声道
+///                                          · 混音开 → 衰减混入（交换恒等）
+///                                          · 都关   → **直通**（恒等置换，被动）
 ///                                                          │ 设备变化/出错
 ///                                                          └─▶ 重新解析（回到上面）
 /// ```
+///
+/// ⚠️ **"两个功能都关"不再是停止通路的理由**（v0.1.1）：那属于「直通」模式，
+///    通路必须继续跑，否则音频进了 BlackHole 出不来（整条链路静音）。
+///    唯一会停通路的是**引擎总开关关闭**。
 public final class ChannelSwapSupervisor: @unchecked Sendable {
 
     /// 依赖：设备解析
@@ -178,7 +185,8 @@ public final class ChannelSwapSupervisor: @unchecked Sendable {
     /// 见 `_runningOutput` 的说明。
     public func devicesChanged() {
         queue.async { [weak self] in
-            // ★ 用 needsAudioPath 而不是 isEnabled：只开混音时通路同样要跑
+            // ★ 用 needsAudioPath（= 引擎总开关）而不是 isEnabled：
+            //   只开混音、乃至直通模式，通路同样要跑
             guard let self, self.settings.needsAudioPath else { return }
             // 设备变化属于"新情况"，重置回退计数，给足重试机会
             self.attempt = 0
@@ -216,7 +224,9 @@ public final class ChannelSwapSupervisor: @unchecked Sendable {
         generation &+= 1                 // 让挂起的回退任务失效
         didNotifyGiveUp = false
 
-        // ★ 只有**两个功能都关**时才停掉通路
+        // ★ 停通路的**唯一**条件是引擎总开关关闭（= 全断）。
+        //   "两个功能都关"不在此列：那是「直通」模式，通路要继续跑
+        //   （否则音频进了 BlackHole 出不来，用户实测为"整条链路静音"）。
         guard newSettings.needsAudioPath else {
             stopAudioLocked()
             attempt = 0
@@ -254,7 +264,8 @@ public final class ChannelSwapSupervisor: @unchecked Sendable {
     ///
     /// - Parameter origin: 本次评估的触发来源 —— **只进日志与诊断**，不影响任何判据。
     private func evaluateLocked(origin: EvaluationOrigin) {
-        // ★ 同理：只开混音也要评估并启动通路
+        // ★ 同理：只开混音、乃至两个都关（直通）时，通路同样要评估并启动 ——
+        //   判据只认引擎总开关。
         guard settings.needsAudioPath else { return }
 
         // ── 1. 输入设备（BlackHole）─────────────────────────────
@@ -325,6 +336,8 @@ public final class ChannelSwapSupervisor: @unchecked Sendable {
         //   first/second 去交换，就会平白把 C/LFE 对调 —— 那既不是用户要的，
         //   也会让混音的目标声道含义错位（实测表现为"开了混音反而更不对"）。
         //   ⇒ 只开混音时，交换计划必须是**恒等**。
+        //   ⇒ 直通模式（引擎开、两个功能都关）同样走这条恒等路径 ——
+        //     区别只在"混音计划为 nil"，于是通路把 N 条声道原样转发。
         let swapWanted = settings.isEnabled
         guard let plan = settings.plan(forOutputChannels: output.usableChannels,
                                        identityWhenDisabled: !swapWanted) else {
@@ -408,14 +421,27 @@ public final class ChannelSwapSupervisor: @unchecked Sendable {
             _runningSettings = settings
             attempt = 0
             didNotifyGiveUp = false
-            // ★ 日志按**当前生效的功能**取名并描述映射。
+            // ★ 日志按**当前生效的模式**取名并描述映射。
             //   只开混音时交换是恒等的，先前会打出
             //   "声道交换已启动…左(第1声道) ↔ 左(第1声道)" ——
             //   既不成立（与自己交换），也会把排查引到交换方向去。
-            let functionName = settings.mixEnabled ? "LFE 混音" : "声道交换"
-            let mapping = settings.mixEnabled
-                ? (resolvedMix.map { $0.description } ?? "混音参数不可用")
-                : plan.swapDescription
+            //   直通模式（引擎开、两个功能都关）同理：它**不是**"什么都没做"，
+            //   而是"通路在跑、原样转发"，日志必须这么写出来 ——
+            //   否则用户看到的就是"没声音也查不出为什么"。
+            let mode = settings.processingMode
+            let functionName: String
+            let mapping: String
+            switch mode {
+            case .mix:
+                functionName = "LFE 混音"
+                mapping = resolvedMix.map { $0.description } ?? "混音参数不可用"
+            case .passThrough:
+                functionName = "声道直通"
+                mapping = "原样转发（恒等映射，\(output.usableChannels) 声道）"
+            case .swap, .off:
+                functionName = "声道交换"
+                mapping = plan.swapDescription
+            }
             Log.info("\(functionName)通路已启动：\(input.name) → \(output.name)"
                      + "（\(output.usableChannels) 声道，\(mapping)，"
                      + "输出单元=\(isDefault ? "DefaultOutput" : "HALOutput 绑设备")）")
@@ -492,10 +518,12 @@ public final class ChannelSwapSupervisor: @unchecked Sendable {
                 framesOut: stats.framesOut,
                 underruns: stats.underruns,
                 renderFailures: stats.renderFailures,
-                // ★ 功能感知：把"现在在跑哪个功能"与"混音实际接线"一并交给 UI。
+                // ★ 功能感知：把"现在在跑哪个模式"与"混音实际接线"一并交给 UI。
                 //   不这样做的话，UI 只能用交换的措辞显示混音状态
                 //   （已确认的适配缺口：显示"交换中" + "恒等映射"）。
-                activeFunction: settings.mixEnabled ? .mix : .swap,
+                //   四种模式（全断/直通/交换/混音）**全部**由引擎给出，
+                //   UI 不许自己按 mixEnabled 推导 —— 否则同屏两处会漂移。
+                activeFunction: settings.processingMode,
                 mixDescription: _mixDescription,
                 // ★ 幂等短路的来源分布（诊断用）：回答"是谁在反复喂评估"。
                 //   真机排查实证：唤醒后连发 5 条"跳过重新装配"，

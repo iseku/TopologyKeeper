@@ -1,6 +1,30 @@
 import CoreAudio
 import Foundation
 
+/// 用户可选的两个声道处理功能（交换 / 混音）。
+///
+/// ⚠️ 与 `ChannelProcessingFunction` 的区别（别混）：
+/// * `ChannelProcessingFunction` = **运行模式**：全断 / 直通 / 交换 / 混音，
+///   由**引擎**给出（`diagnostics.activeFunction`），是"现在在跑什么"的唯一权威；
+/// * 本类型 = **用户想用哪个功能**，只回答"用户上次选的是哪个"，
+///   供界面做记忆与恢复（见 `ChannelSwapSettings.lastEnabledFeature`）。
+public enum ChannelProcessingFeature: String, Codable, Sendable, Equatable, CaseIterable {
+
+    /// 声道交换
+    case swap
+
+    /// LFE 混音
+    case mix
+
+    /// 功能全称（界面标题用）
+    public var displayName: String {
+        switch self {
+        case .swap: return "声道交换"
+        case .mix:  return "LFE 混音"
+        }
+    }
+}
+
 /// 声道交换的**全局设置**（`AppConfig` 顶层字段，与 `rules` 平级）。
 ///
 /// ## 为什么是全局而不是每条规则一个（用户确认，2026-09）
@@ -18,7 +42,36 @@ import Foundation
 /// —— 后者本身不需要修正。
 public struct ChannelSwapSettings: Codable, Equatable, Hashable, Sendable {
 
-    /// 总开关。关闭时引擎不启动、不占用任何音频设备
+    /// ★ **声道处理引擎总开关**（v0.1.1 新增）：本页所有功能的"电源"。
+    ///
+    /// ## 为什么需要它（用户确认的产品定义）
+    ///
+    /// 早先"通路该不该跑"由两个功能开关的**并集**决定
+    /// （`needsAudioPath = isEnabled || mixEnabled`），于是存在三种状态：
+    /// 全断 / 交换 / 混音。而"两个功能都关"时通路**根本没人从 BlackHole 取数据**
+    /// —— 用户的系统默认输出是 BlackHole，此时整条链路直接静音。
+    /// 那个"全断"态在使用中属于**不正常状态**，不该由"关掉两个功能开关"随手进入。
+    ///
+    /// ⇒ 现在把"通路要不要跑"上提到本开关：
+    ///
+    /// | 引擎 | 交换 | 混音 | 模式 | 音频 |
+    /// |------|------|------|------|------|
+    /// | 关 | — | — | **全断** | 通路不跑（不占用任何设备） |
+    /// | 开 | 开 | — | 交换 | 置换后输出 |
+    /// | 开 | — | 开 | 混音 | 衰减混入后输出 |
+    /// | 开 | — | — | **直通**（被动） | 原样转发（恒等置换） |
+    ///
+    /// **默认关闭**：全新安装时用户还没装 BlackHole、也还没配设备，
+    /// 此时绝不能默默把音频链路接管过去。开启时 UI 会先检查 BlackHole 16ch
+    /// 是否存在（见 `AppState`），不存在则提示安装而不是硬开。
+    ///
+    /// ⚠️ **升级迁移**：老配置里没有这个键，若照抄默认值 `false`，
+    /// 已经在用交换/混音的用户升级后会**突然静音**（配置还在、通路不跑）。
+    /// 因此解码时对"缺键"的情形按 `isEnabled || mixEnabled` 推导 ——
+    /// 见 `init(from:)` 的迁移分支，以及 `ChannelProcessingEngineTests` 的 P1 系列。
+    public var engineEnabled: Bool
+
+    /// 声道交换功能开关。**引擎关闭时它不生效**（通路根本不跑）
     public var isEnabled: Bool
 
     /// 输入设备（源）的 UID。默认取第一个名字以 "BlackHole" 开头的设备
@@ -90,19 +143,89 @@ public struct ChannelSwapSettings: Codable, Equatable, Hashable, Sendable {
     /// 是纯粹的电平翻倍、没有任何意义（见 `LfeMixPlan.unavailableReason`）。
     public var mixTargetChannel: Int
 
-    /// **是否需要跑音频通路**（黑马读入 → 处理 → 目标设备输出）。
+    /// 用户**最近一次启用**的功能（交换 / 混音）。**默认交换**。
     ///
-    /// ★ 这是"通路该不该启动"的**唯一**判据，**不是** `isEnabled`。
+    /// ## 为什么需要这个"记忆"（用户实测反馈，v0.1.1）
     ///
-    /// 为什么（实测踩到）：混音与交换是互斥的两个功能，但**共用同一条通路**。
-    /// 早先通路只由 `isEnabled`（交换开关）驱动，于是"开混音、关交换"时
-    /// **通路根本没启动** —— 没人从 BlackHole 读数据、没人往目标设备写，
-    /// 结果是**整个链路静音**（用户实测："开启 LFE 混音后所有声道都没有声音了"）。
+    /// 起因是两个实测问题，根子是同一个 —— 界面上**只有"当前是否开着"这一个信息**，
+    /// 一旦两个功能都关（直通），"用户原本用的是哪个"就丢了：
     ///
-    /// ⇒ 只要**任一**功能开着，通路就必须跑起来。
-    public var needsAudioPath: Bool { isEnabled || mixEnabled }
+    /// 1. **标题跳变**：首页卡片若按"当前生效的功能"取名，两个功能一关，
+    ///    标题就从「LFE 混音」跳成「直通」。用户原话：
+    ///    *"标题栏要记忆保持原先的状态，不要改成直通的标题，只在下面的状态信息提示就行"*。
+    /// 2. **重开跳功能（真 bug）**：首页卡片只有一个开关，判断"该开哪个功能"时
+    ///    若读当前状态 —— 关闭的那一刻 `mixEnabled` 已经是 `false`，
+    ///    于是再打开必然落进"否则开交换"⇒ **无论先前用的是什么，重开都变成交换**。
+    ///    实测复现（用户："不管当前模式是交换还是混音，关闭再打开后都切到了交换"）。
+    ///
+    /// ⇒ 把"用户上次选的功能"显式记下来，两个问题一起消失。
+    ///
+    /// ⚠️ 它**不是**"当前模式"：当前模式看 `processingMode`（引擎权威，
+    ///    可能是全断/直通）。本字段只回答"用户上次用的是哪个功能"。
+    /// ⚠️ 维护点唯一：`ConfigStore.update`（GUI 与 `tkctl` 两条写路径的必经之处），
+    ///    见 `rememberEnabledFeature()`。
+    public var lastEnabledFeature: ChannelProcessingFeature
 
-    public init(isEnabled: Bool = false,
+    /// **是否需要跑音频通路**（BlackHole 读入 → 处理 → 目标设备输出）。
+    ///
+    /// ★ 这是"通路该不该启动"的**唯一**判据，且它现在**只等于总开关**
+    ///   （v0.1.1 起）。
+    ///
+    /// 演进过程（两轮，都是"静默失效/静默静音"换来的）：
+    ///
+    /// * **第一轮**：判据是 `isEnabled`（交换开关）。混音与交换**共用同一条通路**，
+    ///   于是"开混音、关交换"时通路根本没启动 —— 没人从 BlackHole 读数据、
+    ///   没人往目标设备写，**整个链路静音**（用户实测："开启 LFE 混音后所有声道都没声音了"）。
+    /// * **第二轮**（本轮）：判据改成两个功能开关的并集后，又冒出**第三种**态：
+    ///   两个都关 ⇒ 通路不跑 ⇒ 同样整条链路静音。而这时用户的系统默认输出
+    ///   仍是 BlackHole，声音进了 BlackHole 就出不来。用户称之为「全断」，
+    ///   并明确指出这在使用中属于**不正常状态**。
+    ///
+    /// ⇒ 现在的规则很硬：**通路跟着总开关走，功能开关只决定"怎么处理"**。
+    ///   引擎开着而两个功能都关时装配**直通**（恒等置换），而不是断掉。
+    ///
+    /// ⚠️ 因此下面的推论仍然成立并且更强：**任何"该不该启动通路"的判断
+    ///   都必须读本属性，不许读 `isEnabled` / `mixEnabled`**。
+    public var needsAudioPath: Bool { engineEnabled }
+
+    // MARK: - 派生：当前模式（唯一权威，UI 不许自己推导）
+
+    /// 当前应当装配的**模式**：全断 / 直通 / 交换 / 混音。
+    ///
+    /// 这是"现在在跑什么"的**唯一**判据，由引擎写进诊断快照供 UI 显示 ——
+    /// UI 若自己按 `mixEnabled` 之类推导，迟早与引擎漂移（本项目的既有原则）。
+    ///
+    /// ## 非法组合（两个功能都开）为何以**交换**为准
+    ///
+    /// 交换与混音互斥（用户确认的产品定义），`AppState.updateConfig` 与 `tkctl`
+    /// 都会强制拆开。万一还是出现了两者皆真的配置：
+    /// * 运行期实际行为是**交换**（`mixPlan` 检测到非恒等交换时返回"不可用"，
+    ///   `resolvedMix` 为 nil ⇒ 不混音），
+    /// * `AppState.updateConfig` 的兜底也是"保留交换、关掉混音"。
+    /// ⇒ 本属性与它们保持一致（**交换优先**），否则 UI 会显示成"混音中"
+    ///   而实际跑的是交换 —— 那正是本项目最忌讳的"显示的与跑的不是一回事"。
+    public var processingMode: ChannelProcessingFunction {
+        guard engineEnabled else { return .off }
+        if isEnabled { return .swap }
+        if mixEnabled { return .mix }
+        return .passThrough
+    }
+
+
+    /// - Parameter engineEnabled: **总开关**。传 `nil`（默认）表示
+    ///   "跟随功能开关" —— 即 `isEnabled || mixEnabled`。
+    ///
+    ///   为什么默认值是"跟随"而不是写死的 `false`：
+    ///   * **生产**上全新配置走的是 `ChannelSwapSettings()`（两个功能都关）
+    ///     ⇒ 推导结果就是 `false`，与"首次使用默认关闭"的要求一致；
+    ///   * **既有调用点**（测试、探针）大量形如 `ChannelSwapSettings(isEnabled: true)`，
+    ///     它们表达的是"交换开着"，此时通路当然要跑。
+    ///     若这里写死 `false`，这些调用点会集体静默退化成"通路不跑"——
+    ///     那正是本类型存在理由所要防的事。
+    ///   * 要**显式**表达"引擎关掉但功能配置留着"（迁移后的真实状态、
+    ///     "全断"用例），传 `engineEnabled: false` 即可。
+    public init(engineEnabled: Bool? = nil,
+                isEnabled: Bool = false,
                 inputDeviceUID: String? = nil,
                 outputDeviceUID: String? = nil,
                 firstChannel: Int = ChannelSwapPlan.defaultFirstChannel,
@@ -113,7 +236,9 @@ public struct ChannelSwapSettings: Codable, Equatable, Hashable, Sendable {
                 mixEnabled: Bool = false,
                 mixGainDB: Double = LfeMixPlan.defaultGainDB,
                 mixSourceChannel: Int = LfeMixPlan.defaultInputChannel,
-                mixTargetChannel: Int = LfeMixPlan.defaultOutputChannel) {
+                mixTargetChannel: Int = LfeMixPlan.defaultOutputChannel,
+                lastEnabledFeature: ChannelProcessingFeature? = nil) {
+        self.engineEnabled = engineEnabled ?? (isEnabled || mixEnabled)
         self.isEnabled = isEnabled
         self.inputDeviceUID = inputDeviceUID
         self.outputDeviceUID = outputDeviceUID
@@ -126,6 +251,23 @@ public struct ChannelSwapSettings: Codable, Equatable, Hashable, Sendable {
         self.mixGainDB = mixGainDB
         self.mixSourceChannel = mixSourceChannel
         self.mixTargetChannel = mixTargetChannel
+        // 与 `engineEnabled` 同样的"跟随"哲学：不传就按当前开着的功能推断
+        // （混音开着 ⇒ 记忆为混音），既有调用点因此不需要改动。
+        self.lastEnabledFeature = lastEnabledFeature
+            ?? (isEnabled ? .swap : (mixEnabled ? .mix : .swap))
+    }
+
+    /// 记住"用户刚启用了哪个功能"（供界面在功能全关时保持标题、并在重开时恢复）。
+    ///
+    /// 语义：**只有开启才更新**；两个都关时保持原值 —— 那正是"记忆"的意义。
+    /// 非法组合（两个都开）以**交换**为准，与 `processingMode` 保持一致。
+    ///
+    /// ⚠️ 调用点唯一：`ConfigStore.update`（GUI 与 `tkctl` 两条写路径的必经之处）。
+    ///    刻意不散落在各个界面动作里 —— 本项目已因"两条写路径各自维护"踩过坑
+    ///    （`tkctl` 改配置而 App 看不见）。
+    public mutating func rememberEnabledFeature() {
+        if isEnabled { lastEnabledFeature = .swap }
+        else if mixEnabled { lastEnabledFeature = .mix }
     }
 }
 
@@ -162,12 +304,45 @@ extension ChannelSwapSettings {
         // 老配置只存过 mixTargetChannel（目标）：保留它，来源回落默认。
         self.mixTargetChannel = (try? c.decode(Int.self, forKey: .mixTargetChannel))
             ?? d.mixTargetChannel
+
+        // ★★ 总开关的**升级迁移**（v0.1.1 新增字段，必须区分三种情形）：
+        //
+        //   · 键**不存在**（老配置）→ 用户没表过态 → 按现有功能开关推导：
+        //     已经在用交换/混音的配置 ⇒ 引擎视为开启。
+        //     ⚠️ 这一步不能省：若照抄默认值 `false`，老用户升级后
+        //        配置里功能还开着、通路却不跑，**表现为突然全断（无声）**，
+        //        而且界面上功能开关看起来还是"已启用" —— 极难自查。
+        //   · 键存在且为 `true` → 尊重（引擎开着，可能是直通模式）。
+        //   · 键存在且为 `false` → 尊重（用户主动关过引擎，不许自动打开）。
+        //
+        //   真正"全新安装"的情形根本不走这里：那时压根没有配置文件，
+        //   直接 `AppConfig()` ⇒ `ChannelSwapSettings()` ⇒ 总开关为 false，
+        //   正是"首次使用默认关闭"。
+        let storedEngine = (try? c.decodeIfPresent(Bool.self, forKey: .engineEnabled)) ?? nil
+        if let storedEngine {
+            self.engineEnabled = storedEngine
+        } else {
+            self.engineEnabled = self.isEnabled || self.mixEnabled
+        }
+
+        // ★ "最近一次启用的功能"同样要迁移：
+        //   老配置里**混音开着**的话，用户最近用的显然就是混音 ——
+        //   若不迁移就会默认成交换，于是首页卡片标题与实际不符，
+        //   而且"关掉再打开"会跳到交换（实测复现的 bug）。
+        let storedFeature = (try? c.decodeIfPresent(ChannelProcessingFeature.self,
+                                                   forKey: .lastEnabledFeature)) ?? nil
+        if let storedFeature {
+            self.lastEnabledFeature = storedFeature
+        } else {
+            self.lastEnabledFeature = self.isEnabled ? .swap : (self.mixEnabled ? .mix : .swap)
+        }
     }
 
     /// 手写编码：与 `CodingKeys` 一一对应（显式声明 CodingKeys 后 Swift 不再合成）。
     /// 只写新键；废弃的 `mixTargetChannel` 不再输出。
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(engineEnabled, forKey: .engineEnabled)
         try c.encode(isEnabled, forKey: .isEnabled)
         try c.encodeIfPresent(inputDeviceUID, forKey: .inputDeviceUID)
         try c.encodeIfPresent(outputDeviceUID, forKey: .outputDeviceUID)
@@ -180,6 +355,7 @@ extension ChannelSwapSettings {
         try c.encode(mixGainDB, forKey: .mixGainDB)
         try c.encode(mixSourceChannel, forKey: .mixSourceChannel)
         try c.encode(mixTargetChannel, forKey: .mixTargetChannel)
+        try c.encode(lastEnabledFeature, forKey: .lastEnabledFeature)
     }
 
     /// 显式声明全部键。
@@ -189,11 +365,13 @@ extension ChannelSwapSettings {
     /// 里就没有它了；但**老配置里存着这个键**，解码时要读它做兼容。
     /// 所以这里显式列出，并把老键单独声明。
     enum CodingKeys: String, CodingKey {
+        case engineEnabled
         case isEnabled, inputDeviceUID, outputDeviceUID
         case firstChannel, secondChannel
         case alignInputSampleRate, retryBackoffMs, notifyOnGiveUp
         case mixEnabled, mixGainDB
         case mixSourceChannel, mixTargetChannel
+        case lastEnabledFeature
     }
 }
 

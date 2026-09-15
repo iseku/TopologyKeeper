@@ -414,10 +414,57 @@ struct ChannelSwapSettingsTab: View {
 
     @ObservedObject var state: AppState
 
+    /// 「未找到 BlackHole 16ch」提示框的显示状态。
+    ///
+    /// ⚠️ 刻意**不**把"是否已提示过"写进配置：这不是需要持久化的行为参数，
+    ///    每次重新打开设置页都会重置（与日志页的等级选择器同样的取舍）。
+    @State private var showBlackHoleMissingAlert = false
+
     private var settings: ChannelSwapSettings { state.config.channelSwap }
 
     var body: some View {
-        Form {
+        // BlackHole 检测只做一次：`hasBlackHole16chDevice()` 内部是
+        // `audioQueue.sync` + 一次设备枚举，在 body 里反复调用纯属浪费
+        // （而且它会随界面刷新被反复触发）。
+        let hasBlackHole = state.hasBlackHole16chDevice()
+        return Form {
+            // ★★ 本页的**电源**（v0.1.1 新增，用户要求）：
+            //    它决定"通路跑不跑"，下面的交换/混音只决定"怎么处理"。
+            Section("声道处理引擎") {
+                Toggle("启用声道处理引擎", isOn: Binding(
+                    get: { settings.engineEnabled },
+                    set: { newValue in
+                        // ★ 开启前先查 BlackHole 16ch（用户要求）。
+                        //   查不到就**不打开**开关，只弹提示 ——
+                        //   否则用户会看到"已开启"却永远等不到通路，
+                        //   真正的原因（缺驱动）只能去日志里找。
+                        if newValue && !state.hasBlackHole16chDevice() {
+                            showBlackHoleMissingAlert = true
+                        } else {
+                            state.setChannelProcessingEngineEnabled(newValue)
+                        }
+                    }))
+
+                Text("使用声道交换/混音功能请先启用「声道处理引擎」，"
+                     + "引擎关闭后会出现无声现象，请将系统音频输出切换至其它物理音频设备。")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                // 输入侧前提条件（缺失时明确写出来，不让用户去猜）
+                HStack(spacing: 6) {
+                    Image(systemName: hasBlackHole
+                          ? "checkmark.circle.fill" : "xmark.circle.fill")
+                        .font(.system(size: 10))
+                        .foregroundStyle(hasBlackHole ? .green : .red)
+                    Text(hasBlackHole
+                         ? "已检测到 BlackHole 16ch"
+                         : "未检测到 BlackHole 16ch —— 引擎的输入源，需先安装该驱动")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+            }
+
             // ★ 公共区域：交换与混音**共用同一条音频通路、同一对设备**，
             //   所以设备选择只在这里出现一次，不再放在某个功能区块内
             //   （用户指出：放在"交换"区块里会让人以为只对交换生效）。
@@ -458,10 +505,14 @@ struct ChannelSwapSettingsTab: View {
                 Toggle("启用声道交换", isOn: Binding(
                     get: { settings.isEnabled },
                     set: { state.setChannelSwapEnabled($0) }))
-                Text("把中置与低音的声道互换后再输出到播放设备。"
-                     + "用于修正部分应用（如 Wine/Crossover 里的游戏）中置/低音 布局错误的问题。")
+                    // ★ 总开关关闭时功能开关不生效 —— 直接禁用（用户确认的做法），
+                    //   避免"点了没反应"被误判成故障。
+                    .disabled(!settings.engineEnabled)
+                Text("交换任意两个声道的输出，主要用于解决部分应用（中置/低音）布局错误的问题，"
+                     + "把中置与低音的声道互换后再输出到播放设备。")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
 
                 // 声道号一律**对外 1-based**（第 1…8 声道），与「音频MIDI设置」一致。
                 // 标题带上**实际输出设备名**（用户要求）：交换作用在这台设备的声道上，
@@ -500,6 +551,8 @@ struct ChannelSwapSettingsTab: View {
                             if newValue { cfg.channelSwap.isEnabled = false }
                         }
                     }))
+                    // ★ 同上：总开关关闭时功能开关不生效，直接禁用
+                    .disabled(!settings.engineEnabled)
                 // ⚠️ 不要在这里写死"低音声道 / 中置声道"：下面两个下拉框允许改声道号，
                 //    写死语义在用户改动后就变成错的（本轮修掉的问题）。
                 //    实际语义由 `tkctl mix show` 的「设备声明」给出。
@@ -597,12 +650,20 @@ struct ChannelSwapSettingsTab: View {
             }
 
             Section("状态") {
+                // ★ 模式由**引擎**给出（`diagnostics.activeFunction`），界面不自己推导 ——
+                //   否则"交换/混音/直通/全断"会出现两套判断，迟早对不上。
+                LabeledContent("当前模式") {
+                    Text(state.swapDiagnostics.activeFunction.displayName)
+                        .foregroundStyle(settings.engineEnabled ? .primary : .secondary)
+                }
                 LabeledContent("当前状态") {
+                    // 运行态下这里会随模式给出「交换中 / 混音中 / 直通中」；
+                    // 引擎关闭时是「未启用」（= 全断）。
                     Text(state.swapDiagnostics.statusText)
                         .foregroundStyle(state.swapState.needsAttention ? .red : .secondary)
                 }
-                // ★ 用 needsAudioPath 而不是 isEnabled：只开混音时通路同样在跑，
-                //   状态/诊断必须照常显示，否则用户会以为"没生效"。
+                // ★ 判据是 needsAudioPath（= 引擎总开关）：只开混音、乃至直通模式，
+                //   通路同样在跑，状态/诊断必须照常显示，否则用户会以为"没生效"。
                 if settings.needsAudioPath {
                     LabeledContent("设备") {
                         Text(deviceSummary)
@@ -629,6 +690,16 @@ struct ChannelSwapSettingsTab: View {
         }
         .formStyle(.grouped)
         .onAppear { state.refreshSwapDiagnostics() }
+        // ★ 开启总开关时若没有 BlackHole 16ch：明确告诉用户去装驱动，
+        //   而不是让他对着"已开启但一直在等待"的界面自己猜。
+        .alert("未检测到 BlackHole 16ch 音频设备", isPresented: $showBlackHoleMissingAlert) {
+            Button("好", role: .cancel) { }
+        } message: {
+            Text("「声道处理引擎」需要 BlackHole 16ch 作为输入源"
+                 + "（它从虚拟设备的缓冲区读取音频，处理后再输出到播放设备）。\n\n"
+                 + "请先安装 BlackHole 16ch 驱动（免费开源，官网 existential.audio/blackhole），"
+                 + "安装后重新登录或重启，再回来开启本开关。")
+        }
     }
 
     private var deviceSummary: String {

@@ -407,12 +407,12 @@ struct ChannelSwapRowView: View {
                 Circle()
                     .fill(statusColor)
                     .frame(width: 7, height: 7)
-                // ★ 标题与副标题按**当前生效的功能**联动。
-                //   交换与混音互斥、共用同一条通路，首页若一律写"声道交换"，
-                //   开了混音的用户会以为设置没生效。
-                Text(settings.mixEnabled ? "LFE 混音" : "声道交换")
+                // ★ 标题与徽标按**用户上次使用的功能**（记忆）联动，真实状态在下面的状态行。
+                //   为什么不用"当前生效的模式"：两个功能都关时模式是「直通」，
+                //   标题会跳成「直通」而把用户自己的配置信息挤掉（用户实测反馈）。
+                Text(modeTitle)
                     .font(.system(size: 12, weight: .medium))
-                Text(settings.mixEnabled ? mixSummary : settings.swapDescription)
+                Text(modeBadge)
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 5)
@@ -423,26 +423,52 @@ struct ChannelSwapRowView: View {
                 // ★ 开关也联动：混音开启时它控制的是混音，不是交换。
                 //   两个功能互斥，所以首页只需要**一个**开关，
                 //   点它即在"当前生效的那个功能"上做开关。
+                //   两种功能都关（直通）时它是关的，点开即从直通切到交换。
                 Toggle("", isOn: Binding(
-                    get: { settings.needsAudioPath },
+                    get: { settings.isEnabled || settings.mixEnabled },
                     set: { on in
-                        if settings.mixEnabled {
-                            state.setLfeMixEnabled(on)
+                        if on {
+                            // ★ 重开时恢复**用户上次用的那个功能**，而不是"现在哪个开着"。
+                            //   读当前状态必然出错：关闭的那一刻 `mixEnabled` 已经是 false，
+                            //   于是重开一定落进"否则开交换" —— 实测 bug：
+                            //   混音用户关掉再打开会变成交换（用户反馈的"比较严重的问题"）。
+                            switch settings.lastEnabledFeature {
+                            case .swap: state.setChannelSwapEnabled(true)
+                            case .mix:  state.setLfeMixEnabled(true)
+                            }
+                        } else if settings.mixEnabled {
+                            state.setLfeMixEnabled(false)
                         } else {
-                            state.setChannelSwapEnabled(on)
+                            state.setChannelSwapEnabled(false)
                         }
                     }))
                     .labelsHidden()
                     .toggleStyle(.switch)
                     .controlSize(.mini)
+                    // ★ 引擎总开关关闭时功能开关不生效 ⇒ 直接禁用（用户确认的做法），
+                    //   避免"点了没反应"被误判成故障。
+                    .disabled(!settings.engineEnabled)
+                    .help(settings.engineEnabled
+                          ? "启用或停用当前功能（交换 / 混音）"
+                          : "声道处理引擎未启用，请先在「设置 → 声道处理」中开启")
             }
 
             Text(state.swapDiagnostics.statusText)
                 .font(.system(size: 11))
-                .foregroundStyle(statusColor)
+                .foregroundStyle(statusTextColor)
                 .fixedSize(horizontal: false, vertical: true)
 
-            // ★ needsAudioPath：只开混音时通路也在跑，菜单栏要照实显示
+            // 引擎关闭（全断）时补一句"去哪里开"，否则用户只会看到一个灰开关
+            if !settings.engineEnabled {
+                Text("声道处理引擎未启用：音频不经过本工具。"
+                     + "可在「设置 → 声道处理」中开启。")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            // ★ needsAudioPath（= 引擎总开关）：通路在跑就照实显示 ——
+            //   包括只开混音与直通两种情形。
             if settings.needsAudioPath, state.swapState.isRunning {
                 let diag = state.swapDiagnostics
                 VStack(alignment: .leading, spacing: 2) {
@@ -475,13 +501,57 @@ struct ChannelSwapRowView: View {
         "第\(settings.mixSourceChannel)→第\(settings.mixTargetChannel)声道"
     }
 
+    /// 卡片标题 = **用户上次使用的功能**（记忆保持）。
+    ///
+    /// ⚠️ 刻意**不**用"当前生效的模式"（引擎的 `activeFunction`）：
+    ///    两个功能都关时模式是「直通」，标题就会从「LFE 混音」跳成「直通」——
+    ///    用户实测反馈原话："标题栏要记忆保持原先的状态，不要改成直通的标题，
+    ///    只在下面的状态信息提示就行"。真实状态由下面的状态行给出（"直通中"）。
+    private var modeTitle: String {
+        settings.lastEnabledFeature.displayName
+    }
+
+    /// 卡片标题后的徽标：说明"用户那套设置是什么"
+    ///
+    /// 与标题同理，按**记忆的功能**取描述，而不是按当前模式 ——
+    /// 否则功能全关时徽标会变成「原样转发」，把用户自己的配置信息挤掉。
+    private var modeBadge: String {
+        switch settings.lastEnabledFeature {
+        case .swap: return settings.swapDescription
+        case .mix:  return mixSummary
+        }
+    }
+
+    /// 卡片左上角那个**圆点**：反映的是**功能开关**，不是"通路是否在跑"。
+    ///
+    /// ⚠️ 直通（引擎开着、两个功能都关）时圆点必须是**灰**的 ——
+    ///    与 0.1.1 之前的实现保持一致（那时两个都关 ⇒ 通路不跑 ⇒ 圆点灰）。
+    ///    "直通中"这件事**只在下面的状态行**体现（用户实测反馈）。
+    ///    若不这样处理，直通时圆点会亮成强调色，看起来像"功能正在生效"。
     private var statusColor: Color {
+        // 引擎关着时即使功能开关还开着也一律灰（state 会是 .disabled，见下面的分支）
+        guard settings.isEnabled || settings.mixEnabled else { return .secondary }
         switch state.swapState {
         case .running:   return .accentColor
         case .starting:  return .blue
         case .waiting:   return .orange
         case .gaveUp, .failed: return .red
         case .disabled:  return .secondary
+        }
+    }
+
+    /// **状态行文字**的颜色：与圆点分开 —— 它跟着真实状态走。
+    ///
+    /// 直通是"通路在跑但没做处理"，用次要色（不是警告，也不该亮成"功能生效"）；
+    /// 交换/混音运行中才用强调色。
+    private var statusTextColor: Color {
+        switch state.swapState {
+        case .running:
+            return (settings.isEnabled || settings.mixEnabled) ? .accentColor : .secondary
+        case .starting: return .blue
+        case .waiting:  return .orange
+        case .gaveUp, .failed: return .red
+        case .disabled: return .secondary
         }
     }
 }

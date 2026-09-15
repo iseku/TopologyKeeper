@@ -36,6 +36,16 @@ public final class ConfigStore: @unchecked Sendable {
     public func update(_ body: (inout AppConfig) -> Void) {
         lock.lock()
         body(&cached)
+        // ★ 唯一收口点：记住"用户最近启用了哪个功能"。
+        //
+        //   为什么放在这里而不是各个界面动作里：写配置有**两条**路径
+        //   （GUI 的 `AppState.updateConfig` 与 `tkctl` 的 `store.update`），
+        //   本项目已经因为"两条路径各自维护"踩过坑（`tkctl` 改了配置而 App 看不见）。
+        //   放在这里，任何一条路径开启交换/混音都会自动更新记忆，不会漏。
+        //
+        //   它解决两个实测问题（详见 `ChannelSwapSettings.lastEnabledFeature`）：
+        //   功能全关时首页标题跳成「直通」，以及"关掉再打开"总是变成交换。
+        cached.channelSwap.rememberEnabledFeature()
         let snapshot = cached
         let observers = self.observers
         lock.unlock()

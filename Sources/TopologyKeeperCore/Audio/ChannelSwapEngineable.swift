@@ -1,9 +1,11 @@
 import CoreAudio
 import Foundation
 
-/// 当前生效的**声道处理功能**。
+/// 当前生效的**声道处理模式**。
 ///
-/// 「声道交换」与「LFE 混音」互斥（用户确认的产品定义），所以任一时刻至多只有一个生效。
+/// 「声道交换」与「LFE 混音」互斥（用户确认的产品定义），所以任一时刻至多只有一个生效；
+/// 而"引擎开着但两个功能都关"是**第四种合法状态**（v0.1.1 新增的「直通」），
+/// "引擎总开关关闭"则是第五种（「全断」）。
 ///
 /// ## 为什么需要这个类型
 ///
@@ -15,7 +17,25 @@ import Foundation
 /// ⇒ **凡是要展示给用户的**状态文案与映射描述，都必须先经过本类型。
 ///   引擎内部标识符（`swapState` / `ChannelSwapDiagnostics` 等）保持不动：
 ///   它们同时服务交换与混音，改名收益为零而回归面很大。
+///
+/// ⚠️ 本枚举是"现在在跑什么"的**唯一**权威。UI 不许按 `mixEnabled` 之类自己推导，
+///    否则同屏两处显示会漂移（那正是下面那个历史缺口的成因）。
 public enum ChannelProcessingFunction: String, Sendable, Equatable, CaseIterable {
+
+    /// **全断**：引擎总开关关闭 —— 通路根本不跑，不占用任何音频设备。
+    ///
+    /// ⚠️ 此时用户的系统默认输出若仍是 BlackHole，**整条链路无声**。
+    /// 这正是"全断在使用中属于不正常状态"（用户原话）的含义，
+    /// 也是新增总开关与直通模式的直接理由。
+    case off
+
+    /// **直通**：引擎开着，但交换与混音都没开 —— 黑马读入 → 原样转发 → 目标设备。
+    ///
+    /// 数学本质是**恒等置换**（`ChannelSwapPlan.isIdentity`），
+    /// 与"只开混音时交换退化为恒等"走的是同一条已验证的装配路径。
+    ///
+    /// 它是**被动**进入的：用户无法直接选择"直通"，只能通过"关掉两个功能开关"到达。
+    case passThrough
 
     /// 声道交换：置换第 3/4 声道（数学本质是**置换**，零和）
     case swap
@@ -23,19 +43,46 @@ public enum ChannelProcessingFunction: String, Sendable, Equatable, CaseIterable
     /// LFE 混音：把选定的上游声道衰减后混入目标输出声道（数学本质是**求和**，非零和）
     case mix
 
-    /// 功能全称（标题栏用）
+    /// 模式全称（卡片 / 菜单栏提示的**标题**用）
     public var displayName: String {
         switch self {
-        case .swap: return "声道交换"
-        case .mix:  return "LFE 混音"
+        case .off:         return "声道处理"
+        case .passThrough: return "直通"
+        case .swap:        return "声道交换"
+        case .mix:         return "LFE 混音"
         }
     }
 
-    /// 通路运行中的状态文案
+    /// 通路运行中的状态文案（**状态行**用）
     public var runningText: String {
         switch self {
-        case .swap: return "交换中"
-        case .mix:  return "混音中"
+        case .off:         return "未启用"
+        case .passThrough: return "直通中"
+        case .swap:        return "交换中"
+        case .mix:         return "混音中"
+        }
+    }
+
+    /// 一句话说明"这个模式在做什么"（首页副标题 / 配置页说明用）
+    public var modeSummary: String {
+        switch self {
+        case .off:         return "通路未运行（音频不经由本工具）"
+        case .passThrough: return "原样转发"
+        case .swap:        return "置换两个声道"
+        case .mix:         return "把输入声道衰减后混入输出声道"
+        }
+    }
+
+    /// 极简模式名 —— 徽标 / CLI 单行显示用（四个词长度一致，便于对齐）
+    ///
+    /// 为什么不让各展示层自己映射：`tkctl` 与 GUI 各写一份短名，
+    /// 迟早出现"命令行说直通、界面说别的"这种对不上的情况。
+    public var shortName: String {
+        switch self {
+        case .off:         return "全断"
+        case .passThrough: return "直通"
+        case .swap:        return "交换"
+        case .mix:         return "混音"
         }
     }
 }
@@ -48,7 +95,10 @@ public enum ChannelProcessingFunction: String, Sendable, Equatable, CaseIterable
 /// * 回退序列穷尽后仍不满足 → `.gaveUp`，由上层弹告警（用户确认 1-2-4-8 秒）。
 public enum ChannelSwapState: Equatable, Sendable {
 
-    /// 总开关关闭（不占用任何音频设备）
+    /// **引擎总开关关闭**（全断）：不占用任何音频设备，音频不经由本工具。
+    ///
+    /// ⚠️ 与"引擎开着但两个功能都关"（直通，`.running` + `.passThrough`）
+    /// 是**两件完全不同的事**：前者整条链路无声，后者音频照常原样转发。
     case disabled
     /// 正在启动/装配
     case starting
@@ -176,9 +226,9 @@ public struct ChannelSwapDiagnostics: Equatable, Sendable {
     public var underruns: Int64
     public var renderFailures: Int64
 
-    /// 当前生效的声道处理功能（交换 / 混音）。两者互斥，故只有一个。
+    /// 当前生效的**声道处理模式**（全断 / 直通 / 交换 / 混音）。
     ///
-    /// 由引擎按 `settings.mixEnabled` 写入 —— **不要**让 UI 自己推导，
+    /// 由引擎按 `ChannelSwapSettings.processingMode` 写入 —— **不要**让 UI 自己推导，
     /// 否则 UI 与引擎对"现在在跑什么"会有两套判断，必然漂移。
     public var activeFunction: ChannelProcessingFunction
 
@@ -208,7 +258,7 @@ public struct ChannelSwapDiagnostics: Equatable, Sendable {
                 framesOut: Int64 = 0,
                 underruns: Int64 = 0,
                 renderFailures: Int64 = 0,
-                activeFunction: ChannelProcessingFunction = .swap,
+                activeFunction: ChannelProcessingFunction = .off,
                 mixDescription: String? = nil,
                 skipStatistics: String? = nil) {
         self.state = state
@@ -234,6 +284,10 @@ public struct ChannelSwapDiagnostics: Equatable, Sendable {
     /// ⚠️ **不要**直接用 `state.displayText`：那个按"交换"写死，
     /// 开了混音时会显示成"交换中"，是已确认的适配缺口。
     /// 非运行态（等待/失败/未启用）与功能无关，仍走 `state.displayText`。
+    ///
+    /// 运行态文案由 `activeFunction.runningText` 给出，四种模式各不相同：
+    /// * 直通 → **"直通中"**（用户要求：实现直通前这里只能显示"未启用"）
+    /// * 交换 → "交换中"、混音 → "混音中"
     public var statusText: String {
         if case .running = state { return activeFunction.runningText }
         return state.displayText
@@ -243,12 +297,22 @@ public struct ChannelSwapDiagnostics: Equatable, Sendable {
     ///
     /// * 交换 → ChannelMap 的 1-based 描述
     /// * 混音 → 实际生效的混音传递函数
+    /// * 直通 → 明写"直通（恒等映射，N 声道）"，不能让用户以为没生效
+    /// * 全断 / 未装配 → ChannelMap 描述 / "未设置"
     ///
     /// ⚠️ 混音时**绝不能**回落到 `channelMapDescription`：混音不写 ChannelMap，
     /// 那个值恒为"恒等映射（不交换）"，会让用户误判成混音没生效。
     public var mappingDescription: String {
-        guard activeFunction == .mix else { return channelMapDescription }
-        return mixDescription ?? "未装配"
+        switch activeFunction {
+        case .mix:
+            return mixDescription ?? "未装配"
+        case .passThrough:
+            // 直通确实不做任何置换，但它**是在跑的通路** —— 必须与"没设置"区分开
+            guard let map = appliedChannelMap else { return "未设置" }
+            return "直通（恒等映射，\(map.count) 声道）"
+        case .swap, .off:
+            return channelMapDescription
+        }
     }
 
     /// ChannelMap 的 1-based 可读描述，**输入在前**，例
