@@ -1,0 +1,22 @@
+# 构建产物
+.build/
+*.o
+*.dSYM/
+
+# 发布产物（dmg 入库；app bundle 是编译中间产物，不入库）
+Dist/*.app
+
+# 开发文档（内部设计/交接/探针结论，含本机路径与个人标识，不随 GitHub 发布）
+Docs/
+
+# 技术验证探针（开发期临时验证代码，不随 GitHub 发布）
+Probe/
+
+# 临时工作文件
+.tmp-emoji/
+
+# 代码知识图谱索引（codebase-memory 生成，可再生，1.3MB）
+.codebase-memory/
+
+# macOS
+.DS_Store
