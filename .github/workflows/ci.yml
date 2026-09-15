@@ -3,8 +3,25 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
   workflow_dispatch:
+
+# paths-ignore 只忽略"只改了这些文件"的推送：文档改动不影响构建产物，
+# 没必要跑一遍编译与测试。代码与文档一起改时 CI 照常运行。
+#
+# 注意：不要把这套忽略规则扩展到 .github/workflows/** —— 改 workflow 本身
+# 正需要跑一次 CI 来验证 YAML 与触发条件。
+# 另外，若将来给 main 启用 branch protection 并要求 CI 必须通过，
+# 纯文档 PR 会因为"没有任何 CI 状态"而卡在等待中；那时需要额外放一个
+# 空 job 兜底（或改用 required workflow 的 paths 过滤）。
 
 # 只读权限即可：CI 不写回仓库
 permissions:

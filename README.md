@@ -6,8 +6,6 @@
 
 **声道交换**与 **LFE 混音**：修复多声道布局错乱与重低音声道缺失。
 
-
-
 <p align="center">
   <img src="logo.png" alt="TopologyKeeper" width="100">
 </p>
@@ -20,7 +18,7 @@
 
 1. 下载：[TopologyKeeper.dmg（最新版）](https://github.com/iseku/TopologyKeeper/releases/latest/download/TopologyKeeper.dmg)
 2. 安装：打开 DMG，将 `TopologyKeeper.app` 拖入 `Applications`
-3. **首次打开需要手动放行**：本应用未使用 Apple 开发者证书签名，也未经过 Apple 公证，直接双击会被系统拦截，提示「无法打开，因为 Apple 无法检查其是否包含恶意软件」。任选一种方式放行：
+3. 首次打开需要手动放行：本应用未使用 Apple 开发者证书签名，也未经过 Apple 公证，直接双击会被系统拦截，提示「无法打开，因为 Apple 无法检查其是否包含恶意软件」。任选一种方式放行：
    - **图形界面**：打开「系统设置 → 隐私与安全性」，在底部找到关于 `TopologyKeeper` 的拦截提示，点击「仍要打开」，再确认一次。
    - **命令行**：`xattr -dr com.apple.quarantine /Applications/TopologyKeeper.app`
 4. 启动：从启动台打开 `TopologyKeeper`（状态栏出现图标，如出现麦克风授权提醒请确认）
@@ -38,8 +36,6 @@
 - ⚡ **实时处理** — 处理在实时音频回调中完成，非重采样、不写磁盘
 - 🛠 **命令行工具 `tkctl`** — 无需 GUI 即可管理规则、查看状态（需自行构建，不随 dmg 分发）
 
-
-
 ## 📦 自己编译
 
 **环境要求**：macOS 13+ · **Swift 6 工具链**（Xcode 16 及以上的 CommandLineTools 即可，无需完整 Xcode）
@@ -53,12 +49,6 @@ Scripts/build_app.sh          # 构建通用 App 并打包 dmg；产物：Dist/T
 open Dist/TopologyKeeper.app  # 测试运行
 Scripts/test.sh               # 运行单元测试
 ```
-
-> `build_app.sh` 默认构建 **arm64 + x86_64 通用二进制**（分别单架构编译后用 `lipo` 合并）；本地迭代想省一半时间可加 `--native`，只构建本机架构。
->
-> 自行构建出的 App 同样是 ad-hoc 签名，本机运行不受影响；若要分发给他人，需要自行配置 Developer ID 签名与公证。
->
-> 正式的 Release 包由 GitHub Actions 在发布新 Release 时自动构建并附加，仓库内不存放构建产物。
 
 
 
@@ -93,7 +83,6 @@ Scripts/test.sh               # 运行单元测试
 ```bash
 # 构建（产物：.build/spm/release/tkctl）
 Scripts/build.sh --product tkctl
-
 # 建议加入 PATH，之后即可直接调用 tkctl
 export PATH="$PWD/.build/spm/release:$PATH"
 ```
@@ -113,9 +102,10 @@ tkctl help                 # 全部命令
 
 1. Fork 本仓库
 2. 创建功能分支
-3. 提交变更（请附带变更说明与测试结果）
-4. 发起 Pull Request
+3. 提交问题和建议
 
-## 📄 许可证
+
+
+📄 许可证
 
 [MIT License](LICENSE)
