@@ -37,7 +37,7 @@ jobs:
 
     steps:
       - name: 检出该 tag 的源码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ github.event.release.tag_name || inputs.tag }}
 
@@ -47,7 +47,7 @@ jobs:
           xcodebuild -version
 
       - name: 缓存 SwiftPM 构建产物
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: .build
           key: ${{ runner.os }}-spm-universal-${{ hashFiles('Package.swift') }}
