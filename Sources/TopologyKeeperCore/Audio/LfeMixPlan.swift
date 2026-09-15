@@ -76,9 +76,9 @@ public struct LfeMixPlan: Equatable, Sendable {
     // ⚠️ 两个字段都是**缓冲区索引（1-based）**，语义与 `ChannelSwapPlan` 一致：
     //    第 3 声道 = 中置内容所在的缓冲区，第 4 声道 = 低音内容所在的缓冲区。
     //    **不是**"设备的物理声道号" —— 二者在本机设备上并不相同
-    //    （见《探针结论-LFE混音.md》§0.1：设备自报顺序是 L R LFE C）。
+    //    （实测设备自报顺序是 L R LFE C）。
     //    我第一版把这两者混为一谈，写出了"目标 = 低音声道"这种自相矛盾的组合，
-    //    被 M3c / M4d 两个测试拦下 —— 见 §6 踩坑记录。
+    //    被 M3c 等测试拦下。
 
     /// 声道总数（= 目标设备输出声道数）
     public let channelCount: Int
@@ -171,7 +171,6 @@ public struct LfeMixPlan: Equatable, Sendable {
     /// 于是**禁止了两个声道号相同**，并据此认为"同声道会自己叠加"。
     /// 那是错的 —— 编号相同不代表同一个对象。这个错误还进一步导致了
     /// 真正的 bug：驱动用**上游索引**去决定衰减**哪条下游声道**。
-    /// 详见《探针结论-LFE混音.md》§0.7。
     public struct Resolved: Equatable, Sendable {
 
         /// **上游**：从这条 plane 读低音（对外 1-based 缓冲区号）

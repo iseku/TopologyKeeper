@@ -42,7 +42,7 @@ public enum ChannelProcessingFunction: String, Sendable, Equatable, CaseIterable
 
 /// 声道交换引擎的状态。
 ///
-/// 设计原则（对应《探针结论-声道交换.md》§6.1 / 用户确认的三条策略）：
+/// 设计原则（用户确认的三条策略）：
 /// * **<6 声道不是失败**，而是"等待" —— 目标设备可能只是暂时掉回 2ch
 ///   （这正是 TopologyKeeper 格式锁定要治的病），应当退避重试而不是报错。
 /// * 回退序列穷尽后仍不满足 → `.gaveUp`，由上层弹告警（用户确认 1-2-4-8 秒）。

@@ -9,7 +9,7 @@ public struct ListenerToken: Hashable, Sendable {
 
 /// CoreAudio 的唯一抽象边界。
 ///
-/// 铁律（《详细设计.md》§4.1）：**任何 CoreAudio API 调用只能出现在本协议的实现里**。
+/// 铁律：**任何 CoreAudio API 调用只能出现在本协议的实现里**。
 /// 上层（RuleEngine / FormatApplier）只依赖协议，因此可以完全用 Mock 做单元测试。
 ///
 /// 所有实现必须是 `Sendable`：约定**全部方法只在同一条串行队列上调用**
@@ -21,7 +21,7 @@ public protocol CoreAudioServiceProtocol: AnyObject, Sendable {
     func systemDeviceList() -> [AudioDeviceID]
     func allOutputDevices() -> [DeviceDescriptor]
     func deviceDescriptor(forUID uid: String) -> DeviceDescriptor?
-    /// 仅供观测，**永不写入**（D13）
+    /// 仅供观测，**永不写入**
     func defaultOutputDeviceID() -> AudioDeviceID?
     func defaultSystemOutputDeviceID() -> AudioDeviceID?
 
@@ -53,7 +53,7 @@ public protocol CoreAudioServiceProtocol: AnyObject, Sendable {
     // MARK: 监听
 
     /// 注册属性监听。`handler` 会在指定 `queue` 上被调用 ——
-    /// **传入业务串行队列可让回调与其它工作天然有序**（D12）。
+    /// **传入业务串行队列可让回调与其它工作天然有序**。
     @discardableResult
     func addListener(_ target: AudioObjectID,
                      _ address: AudioObjectPropertyAddress,

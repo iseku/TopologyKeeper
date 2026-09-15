@@ -1,6 +1,6 @@
 // ⚠️ 用 `import AppKit` 而**不是** `import Foundation`：
 //    本机只有 CLT，`import Foundation` + `import Testing` 会报
-//    `no such module '_Testing_Foundation'`（见交接说明 §2）。
+//    `no such module '_Testing_Foundation'`。
 //    T20（图标几何）也是这么处理的；AppKit 顺带提供 CGFloat。
 import AppKit
 import Testing

@@ -1,6 +1,6 @@
 import Foundation
 
-/// 全部行为参数（《详细设计.md》附录 B）。
+/// 全部行为参数。
 /// 每个默认值都有实测依据，改动前请先看依据。
 public struct AppConfig: Codable, Equatable, Sendable {
 
@@ -25,13 +25,13 @@ public struct AppConfig: Codable, Equatable, Sendable {
     // MARK: 行为参数
 
     /// 设备事件防抖窗口。
-    /// 依据：实测 `devices-list` 会在 ~0.5s 内密集触发多次（§2.12 单次唤醒触发 8 次）
+    /// 依据：实测 `devices-list` 会在 ~0.5s 内密集触发多次（单次唤醒触发 8 次）
     public var eventDebounceMs: Int
 
     /// 自身写入抑制窗口。
     /// 依据：实测一次写入会触发 `physicalFormat`/`virtualFormat`/`nominalSampleRate`
-    /// 各 2 次（HAL 两阶段提交），回声在 ~400ms 内出现（§2.7）。
-    /// 注意：此窗口是为了防**自触发**，不是为了防死循环（R1 已排除）。
+    /// 各 2 次（HAL 两阶段提交），回声在 ~400ms 内出现。
+    /// 注意：此窗口是为了防**自触发**，不是为了防死循环（该风险已排除）。
     public var selfWriteSuppressMs: Int
 
     /// 写入失败后的重试退避序列
@@ -56,11 +56,11 @@ public struct AppConfig: Codable, Equatable, Sendable {
 
     /// 唤醒后的低频兜底轮询间隔。
     /// 依据：能力到位**总是**伴随设备重建（实测能力监听器从不触发），
-    /// 但万一有例外，用低频轮询兜底（§2.12 / D6）
+    /// 但万一有例外，用低频轮询兜底。
     public var postWakePollIntervalMs: Int
 
     /// 唤醒后轮询持续时间。
-    /// 依据：实测能力到位耗时 19.0s / 28.0s，取 60s 留足余量（§2.12）
+    /// 依据：实测能力到位耗时 19.0s / 28.0s，取 60s 留足余量。
     public var postWakePollDurationMs: Int
 
     /// UI 日志环形缓冲容量

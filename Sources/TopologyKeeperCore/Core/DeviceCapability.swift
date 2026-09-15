@@ -3,7 +3,7 @@ import Foundation
 
 /// 设备当前**实际支持**的格式集合，来自 `kAudioStreamPropertyAvailablePhysicalFormats`。
 ///
-/// 设计依据（《详细设计.md》§2.9 / §10.5）：
+/// 设计依据：
 /// **UI 的三个下拉框不是自由组合，而是这份清单的投影。**
 ///
 /// 实测要点：
@@ -17,7 +17,7 @@ import Foundation
 ///   此时相应维度的可选值只有一个，UI 需要置灰而非崩溃。
 public struct DeviceCapability: Sendable {
 
-    /// 原始条目，**写入时直接照抄**（D2）。顺序保持设备返回的顺序。
+    /// 原始条目，**写入时直接照抄**。顺序保持设备返回的顺序。
     public let entries: [AudioStreamRangedDescription]
 
     public init(entries: [AudioStreamRangedDescription]) {
@@ -72,7 +72,7 @@ public struct DeviceCapability: Sendable {
 
     /// 该三元组是否真实可用。命中则返回**原始条目**（写入时照抄它）。
     ///
-    /// 这是"能力门控"的核心（D9）：返回 nil 表示**能力尚未就绪，
+    /// 这是"能力门控"的核心：返回 nil 表示**能力尚未就绪，
     /// 应该什么都不做并等待**，而不是尝试写入。
     public func entry(channels: UInt32,
                       bitDepth: UInt32,
@@ -134,7 +134,7 @@ extension DeviceCapability {
     /// 用它做**变化检测**，而不是逐字段比较 ——
     /// `AudioStreamRangedDescription` 是 C 结构体且没有 Equatable，
     /// 而语义上我们只关心"可选组合集合有没有变"。
-    /// 实测中这个集合会从 26 个（仅 2ch）变成 155 个（含 8ch）（§2.12）。
+    /// 实测中这个集合会从 26 个（仅 2ch）变成 155 个（含 8ch）。
     public var signature: Set<String> {
         Set(entries.map {
             "\($0.mFormat.mChannelsPerFrame)/\($0.mFormat.mBitsPerChannel)"

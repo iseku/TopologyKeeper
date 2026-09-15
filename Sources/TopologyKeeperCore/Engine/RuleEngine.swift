@@ -3,13 +3,13 @@ import Foundation
 
 /// 规则引擎 —— 持续维持"设备格式 == 预设格式"这个不变式。
 ///
-/// 与原始设计方案的机制差异（D5，实测依据 §2.10 / §2.12）：
+/// 与原始设计的机制差异（实测依据）：
 /// 原方案是「设备事件后固定延迟 800ms，执行一次」。
 /// 但实测从睡眠到设备能力到位需要 **19.0s / 28.0s 且不稳定**（是 800ms 的 24~35 倍），
 /// 固定延迟必然在能力未就绪时执行 → 必然失败。
 ///
 /// 因此改为：**每次触发都重新评估，格式不符就修**。
-/// 能力未就绪时**什么都不做**（D9），等下一次 `devices-list` 事件自然重来
+/// 能力未就绪时**什么都不做**，等下一次 `devices-list` 事件自然重来
 /// —— 实测每次唤醒设备会重建 2~3 次，事件必然再来。
 public final class RuleEngine: @unchecked Sendable {
 
@@ -225,7 +225,7 @@ public final class RuleEngine: @unchecked Sendable {
     }
 
     private func evaluate(rule: DeviceRule, trigger: TriggerKind, bypassSuppression: Bool) {
-        // ── 1. 睡眠期间一律不动作（D8）──────────────────────────
+        // ── 1. 睡眠期间一律不动作────────────────────────────────
         if sleepWake.isSleeping {
             report(rule, state: .suspended(.sleeping))
             return
@@ -268,7 +268,7 @@ public final class RuleEngine: @unchecked Sendable {
             break
         }
 
-        // ── 6. 自身写入抑制（D11）───────────────────────────────
+        // ── 6. 自身写入抑制──────────────────────────────────────
         //   注意：这里直接 return 而不更新状态，保持上一次的状态显示。
         if !bypassSuppression, policy.isSuppressed(rule.id) {
             Log.debug("规则 \(rule.deviceName)：处于自身写入抑制窗口内，跳过本次评估")
@@ -282,7 +282,7 @@ public final class RuleEngine: @unchecked Sendable {
             return
         }
 
-        // ── 8. ★ 能力门控（D9）─────────────────────────────────
+        // ── 8. ★ 能力门控───────────────────────────────────────
         let capability = service.capability(of: descriptor.id)
         guard capability.supports(rule.preset) else {
             // 这不是失败 —— 设备能力尚未到位（唤醒后 0~28 秒内必然出现）。
@@ -505,7 +505,7 @@ public final class RuleEngine: @unchecked Sendable {
 
     // MARK: - 唤醒后兜底轮询
 
-    /// 依据（D6）：能力到位**总是**伴随设备重建（实测能力监听器从不触发），
+    /// 依据：能力到位**总是**伴随设备重建（实测能力监听器从不触发），
     /// 所以主路径是事件驱动。这里只是极低成本的兜底，
     /// 防止某次能力到位没有伴随 `devices-list` 事件。
     private func beginPostWakePolling() {

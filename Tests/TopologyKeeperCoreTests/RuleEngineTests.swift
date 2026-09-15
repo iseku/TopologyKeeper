@@ -3,7 +3,6 @@ import Testing
 @testable import TopologyKeeperCore
 
 // T6–T9：引擎行为
-// 对应《详细设计.md》§13.2。
 
 // MARK: - T6 设备重建后必须 re-arm
 
@@ -33,7 +32,7 @@ struct DeviceWatcherRearmTests {
         #expect(service.registeredSelectors.contains(kAudioStreamPropertyPhysicalFormat))
         // 必须注册 devices-list —— 它是唯一的可靠触发源
         #expect(service.registeredSelectors.contains(kAudioHardwarePropertyDevices))
-        // 不应注册能力清单监听器 —— 实测从不触发（D6）
+        // 不应注册能力清单监听器 —— 实测从不触发
         #expect(!service.registeredSelectors.contains(kAudioStreamPropertyAvailablePhysicalFormats))
     }
 
@@ -211,7 +210,7 @@ struct SelfWriteSuppressionTests {
         #expect(harness.service.setPhysicalFormatCalls.count == 1)
         let writesAfterFirst = harness.writeAttempts
 
-        // 模拟我们的写入引发的回声事件（实测一次写入触发 6 次事件，§2.7）
+        // 模拟我们的写入引发的回声事件（实测一次写入触发 6 次事件）
         harness.emit(.physicalFormatChanged(uid: "TEST-UID", streamID: 200))
         harness.emit(.physicalFormatChanged(uid: "TEST-UID", streamID: 200))
         harness.emit(.nominalRateChanged(uid: "TEST-UID", deviceID: 100))
@@ -401,7 +400,7 @@ struct ConfigChangeTests {
         harness.onQueue { harness.engine.configDidChange() }
 
         #expect(harness.watcher.rearmCount > rearmBefore,
-                "配置变更后必须 rearm —— 受监控的设备集合变了（D7 的另一种情形）")
+                "配置变更后必须 rearm —— 受监控的设备集合变了（另一种情形）")
     }
 
     @Test("T12b 新增规则后应立刻把设备锁到目标格式（而不是等下一次设备事件）")
@@ -541,12 +540,12 @@ struct ThrashDetectionTests {
     }
 }
 
-// MARK: - T14 复刻真实唤醒时间线（I3/I4 的可自动化替代）
+// MARK: - T14 复刻真实唤醒时间线（现场复现的可自动化替代）
 
 @Suite("T14 真实唤醒时间线回归")
 struct WakeTimelineTests {
 
-    /// 复刻 2025-09 实测捕获的序列（可行性分析 §2.12）：
+    /// 复刻 2025-09 实测捕获的序列：
     ///
     /// ```
     /// t=0     睡眠 → 设备消失

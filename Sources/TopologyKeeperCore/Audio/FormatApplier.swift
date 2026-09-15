@@ -3,16 +3,15 @@ import Foundation
 
 /// 把目标格式写入设备，并**强制回读校验**。
 ///
-/// 这是整个项目的心脏，把实测学到的三条纪律全部编码进去
-/// （《详细设计.md》D2 / D3 / D4）：
+/// 这是整个项目的心脏，把实测学到的三条纪律全部编码进去：
 ///
 /// 1. **能力门控**：目标组合不在能力清单里就返回 `.capabilityNotReady`，
-///    **不尝试写入**。唤醒后设备会先只提供 `[2ch]`，此时写入必然失败（§2.12）。
+///    **不尝试写入**。唤醒后设备会先只提供 `[2ch]`，此时写入必然失败。
 /// 2. **照抄条目**：从清单取原始 `AudioStreamRangedDescription`，
 ///    **只覆盖 `mSampleRate`**，绝不自己重算 `mBytesPerFrame`
-///    —— 本设备 20/24bit 是 32bit 容器，重算会静默落到错误格式（§2.2 模式 B）。
+///    —— 本设备 20/24bit 是 32bit 容器，重算会静默落到错误格式（模式 B）。
 /// 3. **回读校验**：`OSStatus == noErr` **不是成功依据**。
-///    实测两种静默失败都返回 noErr（§2.2 模式 A/B）。
+///    实测两种静默失败都返回 noErr（模式 A/B）。
 public struct FormatApplier: Sendable {
 
     private let service: CoreAudioServiceProtocol
@@ -33,7 +32,7 @@ public struct FormatApplier: Sendable {
         // 用于最后区分「模式 A：完全没变」与「模式 B：变了但不对」。
         let before = service.currentPhysicalFormat(of: streams[0])
 
-        // ── 步骤 1：能力门控 + 照抄条目（D2 / D9）──────────────────
+        // ── 步骤 1：能力门控 + 照抄条目 ──────────────────────────
         //
         // ★ 要求**所有**输出流都支持目标组合，而不是"第一个支持的流"。
         //   多输出流设备（USB 音频接口常见）必须整体一致：
@@ -71,7 +70,7 @@ public struct FormatApplier: Sendable {
             return .osStatus(worstStatus)
         }
 
-        // ── 步骤 3：★ 回读校验（D3）──────────────────────────────
+        // ── 步骤 3：★ 回读校验 ───────────────────────────────────
         //   校验**所有**输出流：任何一条流没到位都不能算成功。
         var allStreamsMatched = true
         var after: AudioStreamBasicDescription?
@@ -99,7 +98,7 @@ public struct FormatApplier: Sendable {
             return .applied
         }
 
-        // ── 步骤 4：声道/位深对了但采样率没跟上（F5）──────────────
+        // ── 步骤 4：声道/位深对了但采样率没跟上 ──────────────────
         if after.mChannelsPerFrame == preset.channelCount,
            after.mBitsPerChannel == preset.bitDepth,
            !AudioFormatPreset.ratesEqual(after.mSampleRate, preset.sampleRate) {

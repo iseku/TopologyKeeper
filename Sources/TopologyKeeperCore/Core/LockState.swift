@@ -1,23 +1,23 @@
 import Foundation
 
-/// 失败分类（《详细设计.md》§8）。
+/// 失败分类。
 ///
-/// 之所以分这么细：**两种静默失败模式的排查方向完全不同**（可行性分析 §2.2）
+/// 之所以分这么细：**两种静默失败模式的排查方向完全不同**
 /// —— "设备被独占"要查别的工具，"落到错误格式"要查我们自己的 ASBD 构造。
 /// 混在一起就没法诊断了。
 public enum FailureKind: Equatable, Sendable {
-    /// F3：写入返回 `noErr`，但回读发现**完全没变**。
+    /// 写入返回 `noErr`，但回读发现**完全没变**。
     /// 典型原因：设备被其它工具独占（实测 SoundSource 会导致此现象）。
     case notEffective
 
-    /// F4：写入返回 `noErr`，但**落到了另一个格式**。
+    /// 写入返回 `noErr`，但**落到了另一个格式**。
     /// 典型原因：ASBD 构造错误（例如自己重算了 `mBytesPerFrame`）。
     case wrongFormat
 
-    /// F5：声道/位深对了，但采样率没跟上（补设标称采样率也无效）。
+    /// 声道/位深对了，但采样率没跟上（补设标称采样率也无效）。
     case sampleRateNotApplied
 
-    /// F7：真实的 OSStatus 错误。
+    /// 真实的 OSStatus 错误。
     case osStatus(Int32)
 
     /// 其它
@@ -41,11 +41,11 @@ public enum FailureKind: Equatable, Sendable {
 
 /// 挂起原因
 public enum SuspendReason: Equatable, Sendable {
-    /// 系统正在睡眠 —— 实测此时设备以 `[2ch]` 状态存在 16 秒，不应动作（D8）
+    /// 系统正在睡眠 —— 实测此时设备以 `[2ch]` 状态存在 16 秒，不应动作
     case sleeping
     /// 用户手动暂停该规则
     case userPaused
-    /// 连续冲突后进入退避，避免与其它工具互相争夺（D11 / G3）
+    /// 连续冲突后进入退避，避免与其它工具互相争夺
     case conflictBackoff
     /// 规则策略为"仅插拔/唤醒时恢复"，而本次触发是就地变更
     case policyOnConnectOnly
@@ -62,8 +62,8 @@ public enum SuspendReason: Equatable, Sendable {
 
 /// 单条规则的运行时锁定状态。
 ///
-/// ⚠️ 与原始设计方案（只有 3 态）相比，这里**新增了两态**：
-/// * `waitingForCapability` —— 唤醒后 0~28 秒内的**必经状态**（实测 §2.12）。
+/// ⚠️ 与只有 3 态的早期版本相比，这里**新增了两态**：
+/// * `waitingForCapability` —— 唤醒后 0~28 秒内的**必经状态**（实测）。
 ///   没有它，用户会以为工具坏了。
 /// * `applying` —— 正在写入。
 public enum LockState: Equatable, Sendable {
@@ -71,7 +71,7 @@ public enum LockState: Equatable, Sendable {
     case noRule
     /// 规则存在但设备当前不在
     case deviceAbsent
-    /// 设备在，但目标组合尚未出现在能力清单里 —— 等待，不写入（D9）
+    /// 设备在，但目标组合尚未出现在能力清单里 —— 等待，不写入
     case waitingForCapability(availableMaxChannels: UInt32)
     /// 已是目标格式
     case locked

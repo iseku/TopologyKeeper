@@ -4,7 +4,7 @@ import ServiceManagement
 
 /// 开机自启动。
 ///
-/// 设计（《详细设计.md》§11.3）：
+/// 设计：
 /// 本机**没有代码签名身份**，`SMAppService` 已知会报 "Operation not permitted"。
 /// 因此：
 /// * 有有效签名（含 team identifier）→ 用 `SMAppService`（官方推荐）

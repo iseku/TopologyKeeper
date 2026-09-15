@@ -3,7 +3,6 @@ import Testing
 @testable import TopologyKeeperCore
 
 // T1–T5：FormatApplier 的核心行为
-// 对应《详细设计.md》§13.2。
 //
 // 这一组测试锁死的是本项目最重要的三条纪律：
 //   1. 能力门控 —— 组合不可用时**绝不写入**
@@ -33,12 +32,12 @@ struct FormatApplierTests {
         #expect(mock.setPhysicalFormatCalls.count == 1)
     }
 
-    // MARK: T2 能力未就绪 → 绝不写入（D9）
+    // MARK: T2 能力未就绪 → 绝不写入
 
     @Test("T2 目标组合不在能力清单时返回 capabilityNotReady 且不写入任何设备")
     func capabilityNotReady() {
         let mock = MockCoreAudioService()
-        // 模拟唤醒早期状态：设备只提供 2ch（实测 §2.12 的前两次出现）
+        // 模拟唤醒早期状态：设备只提供 2ch（实测的前两次出现）
         var entries: [AudioStreamRangedDescription] = []
         for bits in [UInt32(16), UInt32(20), UInt32(24)] {
             let container: UInt32 = (bits == 16) ? 2 : 4

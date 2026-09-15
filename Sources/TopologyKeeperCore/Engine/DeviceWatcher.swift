@@ -5,18 +5,18 @@ import Foundation
 ///
 /// 两条实测得出的硬性要求：
 ///
-/// **1. 触发源只需要 `kAudioHardwarePropertyDevices`**（D6）
-/// 实测（§2.12）：能力从 `[]` 变成 `[2..8]`（组合 0 → 155）时，
+/// **1. 触发源只需要 `kAudioHardwarePropertyDevices`**
+/// 实测：能力从 `[]` 变成 `[2..8]`（组合 0 → 155）时，
 /// `kAudioStreamPropertyAvailablePhysicalFormats` 监听器**一次都没触发** ——
 /// 因为设备是**带着全部能力被创建出来的**，不存在"活动对象能力变化"这种事件。
 /// 而 `devices-list` 单次唤醒触发 **8 次**，完整覆盖每次出现/消失。
 /// 所以这里**不注册**能力监听器（注册了也是浪费）。
 ///
-/// **2. 设备重建后必须重新注册**（D7）
+/// **2. 设备重建后必须重新注册**
 /// 实测 `AudioDeviceID` 每次重建都变：`142 → 177 → 207 → 222`；
 /// 旧监听器随旧对象销毁，不重新注册就会**静默失效**。
 /// ⚠️ 我自己的诊断程序曾漏掉这一步，导致跑出"监听器不触发"的**错误结论**。
-/// 因此这条逻辑有专门的单元测试（T6）锁死。
+/// 因此这条逻辑有专门的单元测试锁死。
 public final class DeviceWatcher: DeviceWatching, @unchecked Sendable {
 
     private let service: CoreAudioServiceProtocol
@@ -110,7 +110,7 @@ public final class DeviceWatcher: DeviceWatching, @unchecked Sendable {
                 self.scheduleDevicesChanged()
             })
 
-        // 下面两个仅用于**观测**，永不写入（D13）
+        // 下面两个仅用于**观测**，永不写入
         systemTokens.append(service.addListener(
             AudioObjectID(kAudioObjectSystemObject),
             CoreAudioHelpers.address(kAudioHardwarePropertyDefaultOutputDevice),
@@ -168,7 +168,7 @@ public final class DeviceWatcher: DeviceWatching, @unchecked Sendable {
         onEvent?(.devicesChanged(trigger: .deviceEvent))
     }
 
-    // MARK: - ★ 重新注册（D7 的核心）
+    // MARK: - ★ 重新注册
 
     /// 检查所有受监控设备，按需 (re)arm。
     ///
@@ -219,7 +219,7 @@ public final class DeviceWatcher: DeviceWatching, @unchecked Sendable {
         Log.info("RE-ARM device/stream listeners → uid=\(uid) deviceID=\(deviceID) "
                  + "streams=\(streamIDs)")
 
-        // 就地变更监听：这些在"活动对象被就地改动"时确实会触发（§2.7 实测）
+        // 就地变更监听：这些在"活动对象被就地改动"时确实会触发（实测）
         tokens.append(service.addListener(deviceID,
             CoreAudioHelpers.address(kAudioDevicePropertyNominalSampleRate),
             queue: queue) { [weak self] in

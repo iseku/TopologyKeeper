@@ -3,7 +3,7 @@ import Foundation
 
 /// 一个具体音频格式的**最小充分表示**。
 ///
-/// 设计依据（《详细设计.md》D1 / 可行性分析 §2.2）：
+/// 设计依据：
 /// 实测证明只存 (声道数, 位深, 采样率) 三个整数是不够的 ——
 /// 本设备的 20bit/24bit 采用 **32bit 容器**（`mBytesPerFrame = 声道数 × 4`），
 /// 而 16bit 才是紧凑打包（`声道数 × 2`）。
@@ -42,7 +42,7 @@ public struct AudioFormatPreset: Codable, Equatable, Hashable, Sendable {
 
     /// 从设备能力清单取一条条目，**只覆盖采样率，其余原样照抄**。
     ///
-    /// 这是本项目最重要的实现纪律（D2）：
+    /// 这是本项目最重要的实现纪律：
     /// 实测对照 —— 照抄法 5/5 正确，手工重算字节数 1/3 正确。
     /// **绝不要自己计算 `mBytesPerFrame`。**
     public init(verbatim entry: AudioStreamRangedDescription, sampleRate: Double) {

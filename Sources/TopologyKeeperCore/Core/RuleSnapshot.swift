@@ -3,7 +3,7 @@ import Foundation
 /// 某条规则的运行时快照，供 UI 展示。
 ///
 /// 刻意同时包含 **预设值** 与 **当前值** ——
-/// 因为实测证明写入可能静默失败（§2.2），
+/// 因为实测证明写入可能静默失败，
 /// 只显示"当前格式"的话用户无法判断锁定到底有没有生效。
 public struct RuleSnapshot: Equatable, Sendable, Identifiable {
 

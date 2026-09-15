@@ -1,14 +1,27 @@
 import CoreAudio
+import Darwin
 import Dispatch
 import Testing
 @testable import TopologyKeeperCore
 
-// 真实 CoreAudio 的集成测试（不需要外部硬件，只增删监听器 / 读属性）。
+// 真实 CoreAudio 的集成测试（多数用例不需要外部硬件，只增删监听器 / 读属性）。
 //
 // 这一组存在的意义：监听器生命周期是**最容易被静默写错**的地方 ——
 // 注册/移除的队列不匹配、迭代中修改字典、设备重建后忘记重注册，
 // 这三种错误都不会报错，只会让功能悄悄失效。
 // 因此这里直接跑真实 HAL 调用，而不是用 Mock。
+
+/// I-e / I-g 依赖「本机真实存在输出设备」这一前提。
+///
+/// GitHub Actions 的 macOS VM 没有虚拟音频设备
+/// （actions/runner-images#3526），CI 上通过 `TK_SKIP_AUDIO_HW_TESTS=1`
+/// 显式跳过这两条，而不是把 `#expect` 弱化成「没设备就 return」——
+/// 后者会让本机真正的「枚举不到设备」故障失去告警。
+///
+/// 这里刻意用 `getenv` 而不是 `ProcessInfo`：本机只有 CommandLineTools，
+/// 其 `Testing.framework` 不含 `_Testing_Foundation`，同一文件里
+/// `import Foundation` + `import Testing` 会直接编译失败。
+private let hasRealAudioDevice = getenv("TK_SKIP_AUDIO_HW_TESTS") == nil
 
 @Suite("CoreAudioService 集成（真实 HAL）")
 struct CoreAudioServiceIntegrationTests {
@@ -91,7 +104,7 @@ struct CoreAudioServiceIntegrationTests {
         #expect(service.listenerCount == 0)
     }
 
-    @Test("I-e 枚举真实输出设备：UID 唯一、能解析回同一设备")
+    @Test("I-e 枚举真实输出设备：UID 唯一、能解析回同一设备", .enabled(if: hasRealAudioDevice))
     func enumeratesRealDevices() {
         let service = makeService()
         let devices = service.allOutputDevices()
@@ -138,7 +151,7 @@ struct CoreAudioServiceIntegrationTests {
         }
     }
 
-    @Test("I-g 默认输出设备与默认系统输出设备是两个不同属性（我早期搞混过）")
+    @Test("I-g 默认输出设备与默认系统输出设备是两个不同属性（我早期搞混过）", .enabled(if: hasRealAudioDevice))
     func defaultDevicePropertiesAreDistinct() {
         let service = makeService()
         // 至少默认输出设备必须存在

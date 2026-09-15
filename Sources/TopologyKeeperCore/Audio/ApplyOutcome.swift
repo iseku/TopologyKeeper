@@ -3,30 +3,30 @@ import Foundation
 
 /// `FormatApplier.apply` 的结果。
 ///
-/// 每个 case 对应一种**明确不同的处理方式**（《详细设计.md》§8）。
+/// 每个 case 对应一种**明确不同的处理方式**。
 /// 特别重要的是把"没生效"和"落到错误格式"分开 ——
-/// 两者都返回 `noErr`，但排查方向完全不同（可行性分析 §2.2）。
+/// 两者都返回 `noErr`，但排查方向完全不同。
 public enum ApplyOutcome: Equatable, Sendable {
 
     /// 写入成功且回读校验通过
     case applied
 
-    /// 目标组合当前不在能力清单里 —— **不算失败**，应等待（D9）
+    /// 目标组合当前不在能力清单里 —— **不算失败**，应等待
     case capabilityNotReady(availableMaxChannels: UInt32)
 
     /// 设备没有输出流
     case noOutputStreams
 
-    /// F3：返回 `noErr` 但**完全没变**（多为设备被其它工具独占）
+    /// 返回 `noErr` 但**完全没变**（多为设备被其它工具独占）
     case notEffective(before: AudioStreamBasicDescription, after: AudioStreamBasicDescription)
 
-    /// F4：返回 `noErr` 但落到了**另一个格式**（多为 ASBD 构造问题）
+    /// 返回 `noErr` 但落到了**另一个格式**（多为 ASBD 构造问题）
     case wrongFormat(wanted: AudioStreamBasicDescription, got: AudioStreamBasicDescription)
 
-    /// F5：声道/位深对，但采样率补设后仍未生效
+    /// 声道/位深对，但采样率补设后仍未生效
     case sampleRateNotApplied(wanted: Double, got: Double)
 
-    /// F7：真实 OSStatus 错误
+    /// 真实 OSStatus 错误
     case osStatus(Int32)
 
     public var isSuccess: Bool {

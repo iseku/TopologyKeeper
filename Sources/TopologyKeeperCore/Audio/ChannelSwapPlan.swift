@@ -3,7 +3,7 @@ import Foundation
 
 /// 声道交换计划 —— **纯逻辑**，不碰任何硬件，可完整单测。
 ///
-/// 背景（《探针结论-声道交换.md》§3）：
+/// 背景：
 /// AUHAL 的 `kAudioOutputUnitProperty_ChannelMap` 接受 `map[dst] = src`
 /// 形式的**任意置换**（SDK `AudioUnitProperties.h:2437`），-1 表示该目标声道静音。
 /// 因此"交换中置与低音"就是 `map[2] = 3; map[3] = 2`，

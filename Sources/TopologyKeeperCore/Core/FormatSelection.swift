@@ -4,10 +4,10 @@ import Foundation
 /// 级联格式选择器背后的选择状态。
 ///
 /// 放在 Core 而不是 UI 层，是为了让"级联归一化"这段逻辑可以单元测试
-/// —— 它是 UI 正确性的关键（《详细设计.md》§10.5）。
+/// —— 它是 UI 正确性的关键。
 ///
 /// 核心规则：三个维度**不是自由组合**，而是设备能力清单的投影。
-/// 实测（§2.9）21 种组合中只有 `2ch/16bit` 支持 768000，
+/// 实测 21 种组合中只有 `2ch/16bit` 支持 768000，
 /// 用户先选它再改声道数就会造出非法组合。
 public struct FormatSelection: Equatable, Sendable {
 
@@ -134,7 +134,7 @@ extension DeviceCapability {
         guard let entry = entry(channels: selection.channelCount,
                                 bitDepth: selection.bitDepth,
                                 sampleRate: selection.sampleRate) else { return nil }
-        // ★ 照抄条目，只覆盖采样率（D2）
+        // ★ 照抄条目，只覆盖采样率
         return AudioFormatPreset(verbatim: entry, sampleRate: selection.sampleRate)
     }
 }

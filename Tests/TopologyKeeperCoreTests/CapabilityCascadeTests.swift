@@ -3,7 +3,6 @@ import Testing
 @testable import TopologyKeeperCore
 
 // T10–T11：能力清单的级联查询与边界情况
-// 对应《详细设计.md》§10.5 与 §13.2。
 //
 // 这一组锁死的是 UI 格式选择器的正确性 ——
 // 三个下拉框必须是能力清单的**投影**，不能让用户自由拼维度。
@@ -104,7 +103,7 @@ struct CapabilityCascadeTests {
 
     @Test("能力签名能检测出 2ch → 2..8ch 的变化（唤醒场景）")
     func signatureDetectsCapabilityGrowth() {
-        // 唤醒早期：只有 2ch（实测 §2.12 的第 1、2 次出现）
+        // 唤醒早期：只有 2ch（实测的第 1、2 次出现）
         let early = DeviceCapability(entries: (2...2).flatMap { channels in
             [UInt32(16), UInt32(20), UInt32(24)].map { bits in
                 makeRanged(makeASBD(channels: UInt32(channels), bits: bits,

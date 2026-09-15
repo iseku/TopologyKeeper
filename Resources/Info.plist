@@ -18,7 +18,7 @@
 	<string>TopologyKeeper</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
-	<!-- 发布版本号（用户确认）。与文档里的 v1/v2/v3 区分：
+	<!-- 发布版本号。注意与**功能阶段**编号（v1/v2/v3）区分：
 	     后者指**功能阶段**，此处是**对外版本号**，两者不是一回事。 -->
 	<key>CFBundleShortVersionString</key>
 	<string>0.1.0</string>
@@ -32,7 +32,6 @@
 	<!-- ★ 声道处理功能需要**读取** BlackHole 这个虚拟输入设备，
 	     走的是 CoreAudio 的输入侧，会触发 TCC 的麦克风授权。
 	     缺了这条 key，App 在首次读取输入时会**直接崩溃**（不是被拒绝）。
-	     依据：《探针结论-声道交换.md》§7「TCC」一行。
 	     ⚠️ 文案必须同时覆盖「交换」与「混音」两个功能 —— 两者共用这条通路。 -->
 	<key>NSMicrophoneUsageDescription</key>
 	<string>TopologyKeeper 需要读取虚拟音频设备（如 BlackHole）的音频内容，用于声道交换与 LFE 混音后输出到播放设备。</string>

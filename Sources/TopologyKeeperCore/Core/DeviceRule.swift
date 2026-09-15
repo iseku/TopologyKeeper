@@ -3,13 +3,13 @@ import Foundation
 
 /// 冲突策略。
 ///
-/// 默认 `enforceAlways`（O2 决策，2025-09）：
+/// 默认 `enforceAlways`（2025-09 决策）：
 /// 本工具的定位是**取代 SoundSource 的采样率锁定**
 /// —— 后者此前用于对抗"采样率自动跳到 192k"。
 /// 因此需要**持续维持**，而不只是插拔/唤醒时恢复一次。
 ///
 /// 若将来同时运行其它会锁定格式的工具，会与它持续争夺；
-/// 此时实测争夺失败方会**静默失败**（可行性分析 §2.2 模式 A），
+/// 此时实测争夺失败方会**静默失败**（模式 A），
 /// 因此保留 `onConnectOnly` 与 `paused` 作为降级选项。
 public enum ConflictPolicy: String, Codable, CaseIterable, Sendable {
     /// 任何时候发现格式不符就改回来（默认）
@@ -58,7 +58,7 @@ public struct DeviceRule: Codable, Identifiable, Equatable, Sendable {
 
     // MARK: 设备识别
 
-    /// 主匹配键。实测跨唤醒/拔插保持稳定（D7）
+    /// 主匹配键。实测跨唤醒/拔插保持稳定
     public var deviceUID: String
     /// 展示用，兼作 UID 失效时的兜底匹配
     public var deviceName: String
@@ -70,14 +70,14 @@ public struct DeviceRule: Codable, Identifiable, Equatable, Sendable {
 
     // MARK: 目标格式
 
-    /// 完整 ASBD 语义（D1）
+    /// 完整 ASBD 语义
     public var preset: AudioFormatPreset
 
     // MARK: 行为
 
-    /// 冲突策略，默认持续锁定（O2）
+    /// 冲突策略，默认持续锁定
     public var conflictPolicy: ConflictPolicy
-    /// 强制回读校验。**不建议关闭** —— `noErr` 不可信（D3）
+    /// 强制回读校验。**不建议关闭** —— `noErr` 不可信
     public var verifyAfterApply: Bool
 
     // MARK: 运行时诊断（持久化以便排查）
@@ -117,7 +117,7 @@ extension DeviceRule {
     /// 设备是否匹配本规则。
     ///
     /// 优先 UID（实测稳定）；UID 不匹配时按 名称+传输类型 兜底，
-    /// 以便 UID 因换端口而变化时仍能识别（G4 / §5.2）。
+    /// 以便 UID 因换端口而变化时仍能识别。
     public func matches(_ descriptor: DeviceDescriptor) -> Bool {
         if descriptor.uid == deviceUID { return true }
         // 兜底：UID 变了但看起来仍是同一台设备

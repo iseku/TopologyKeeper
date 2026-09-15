@@ -208,7 +208,7 @@ struct RuleEditorView: View {
     // MARK: - 保存
 
     private func save() {
-        // ★ 保存前必须做存在性校验（《详细设计.md》§10.5）
+        // ★ 保存前必须做存在性校验
         guard let preset = capability.preset(for: selection) else {
             loadError = "该组合在当前设备能力清单中不存在，无法保存。"
             return

@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 只读权限即可：CI 不写回仓库
+permissions:
+  contents: read
+
+# 同一分支的新推送取消上一次仍在跑的构建
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: 构建与测试（macOS / Swift 6）
+    runs-on: macos-latest
+
+    env:
+      # GitHub Actions 的 macOS VM 没有虚拟音频设备（actions/runner-images#3526），
+      # 因此跳过 2 个依赖真实输出设备的集成用例（I-e / I-g）。
+      # 其余用例照常运行；本机开发不要设置这个变量，以便完整覆盖。
+      TK_SKIP_AUDIO_HW_TESTS: "1"
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 工具链版本
+        run: |
+          swift --version
+          xcodebuild -version
+
+      - name: 缓存 SwiftPM 构建产物
+        uses: actions/cache@v4
+        with:
+          path: .build
+          key: ${{ runner.os }}-spm-${{ hashFiles('Package.swift') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+
+      # 构建与打包一律走 Scripts/ 下的脚本，保证本地与 CI 是同一条路径。
+      # 只有测试用裸 `swift test`：Scripts/test.sh 硬依赖 CommandLineTools 里
+      # Testing.framework 的非常规位置（只有「无完整 Xcode」的本机才需要），
+      # 而 runner 有完整 Xcode，`swift test` 原生即可使用 Swift Testing。
+      - name: 运行单元测试
+        run: swift test
+
+      # 与 release 完全相同的出包路径：两个单架构分别编译后 lipo 合并。
+      # 放在 CI 里跑，是为了让 x86_64 编译错误或 dmg 打包问题在 PR 阶段就暴露，
+      # 而不是等到发版时才发现。
+      - name: 构建通用 App 并打包 dmg
+        run: Scripts/build_app.sh --universal
+
+      - name: 校验发布产物（架构 / 签名 / dmg 内容）
+        run: Scripts/verify_app.sh
+
+      - name: 构建命令行工具 tkctl
+        run: Scripts/build.sh -c release --product tkctl

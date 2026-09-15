@@ -45,7 +45,7 @@ public enum SettingsWindowPlacement {
 
     /// 算出设置窗口的原点。
     ///
-    /// 坐标系见类型文档：**左下原点、y 向上增长**。
+    /// 坐标系：**左下原点、y 向上增长**。
     /// - Parameter windowSize: 窗口尺寸（含标题栏的 frame 尺寸）
     /// - Parameter screenVisibleFrame: 图标所在屏幕的**可见**区域
     ///   （用可见区域而非整屏：含菜单栏/Dock 的整屏会让夹紧失效）

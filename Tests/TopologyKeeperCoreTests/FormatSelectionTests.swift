@@ -2,10 +2,10 @@ import CoreAudio
 import Testing
 @testable import TopologyKeeperCore
 
-// 级联选择器逻辑的单元测试（《详细设计.md》§10.5 / T10）。
+// 级联选择器逻辑的单元测试。
 //
 // 这段逻辑是 UI 正确性的关键：三个下拉框**不是自由组合**，
-// 而是设备能力清单的投影。实测依据 §2.9：
+// 而是设备能力清单的投影。实测依据：
 // 27C3A Pro 的 21 种组合中，只有 2ch/16bit 支持 768000。
 
 @Suite("级联格式选择")

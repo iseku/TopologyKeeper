@@ -3,8 +3,13 @@
 *.o
 *.dSYM/
 
-# 发布产物（dmg 入库；app bundle 是编译中间产物，不入库）
-Dist/*.app
+# 构建输出目录：整个不入库。
+# app 与 dmg 一律由构建脚本生成——本地用 Scripts/build_app.sh，
+# 云端由 .github/workflows/release.yml 在发布新 Release 时生成并作为 asset 上传。
+# 这样做还有一个原因：dmg 每次构建的字节都不同（内嵌时间戳），
+# 入库只会产生无法解读的二进制 diff，还会让「仓库里的 dmg」与
+# 「Release 上的 dmg」变成两个不同的二进制。
+Dist/
 
 # 开发文档（内部设计/交接/探针结论，含本机路径与个人标识，不随 GitHub 发布）
 Docs/

@@ -5,17 +5,17 @@ import Foundation
 
 /// 声道交换的**音频数据通路**（真实实现）。
 ///
-/// 架构与《探针结论-声道交换.md》验证过的探针一致：
+/// 架构与已验证过的探针一致：
 ///
 /// ```
 /// 输入单元 H（AUHAL）              输出单元 O（AUHAL）
 ///   bus1 输入  ──▶ AudioUnitRender 取数据
-///      │（回调内必须调用 AudioUnitRender，ioData 不携带音频 —— 见结论 §2）
+///      │（回调内必须调用 AudioUnitRender，ioData 不携带音频）
 ///      ▼  取前 N 声道
 ///   无锁 SPSC 环形缓冲（Float32，按声道分 plane）
 ///      │
 ///      ▼  填入输出缓冲
-///   ChannelMap（★ 必须始终设置，否则 HAL 会丢声道 —— 见结论 §5.2）
+///   ChannelMap（★ 必须始终设置，否则 HAL 会丢声道）
 /// ```
 ///
 /// ## ★ 为什么"交换"由我们自己搬样本，而不是交给 HAL 的 ChannelMap
@@ -30,7 +30,7 @@ import Foundation
 ///
 /// 结论：**交换由我们自己在渲染回调里做**（纯数据置换，与单元类型无关）；
 /// `ChannelMap` 只写**恒等映射**，用途退化为"防止 HAL 丢声道"
-/// （实测不设它时只播出 6 路，见结论文档 §5.2）。
+/// （实测不设它时只播出 6 路）。
 ///
 /// 代价：每帧多几次索引访问（8 声道约 1–2% CPU），换来的是行为可预期。
 ///
@@ -143,8 +143,7 @@ public final class ChannelSwapAudioDriver: ChannelSwapAudioDriving, @unchecked S
     /// BlackHole 里真的有音频"就能验证**交换是否生效**。
     ///
     /// 为什么用**逐段序列**（同一时刻只有 1 路出声）而不是多路同时出声：
-    /// 实测本机"8 路同时出声"只能播出固定两路，序列形态才能完整播出所有声道
-    /// （见《探针结论-声道交换.md》§5.3）。
+    /// 实测本机"8 路同时出声"只能播出固定两路，序列形态才能完整播出所有声道。
     public var diagnosticToneEnabled = false
     /// 每段的时长（毫秒）
     public var diagnosticToneSegmentMs = 1200
@@ -423,7 +422,7 @@ public final class ChannelSwapAudioDriver: ChannelSwapAudioDriving, @unchecked S
     private func setupOutputUnit(device: ChannelSwapDeviceInfo,
                                  isSystemDefault: Bool,
                                  identityMap: [Int32]) throws {
-        // ★ 单元类型选择（依据结论文档 §6.1）：
+        // ★ 单元类型选择：
         //   目标设备 == 系统默认输出 → DefaultOutput（该路径已听感确认可用）
         //   否则 → HALOutput + 显式绑设备（DefaultOutput 会写错设备）
         let subtype: OSType = isSystemDefault
@@ -486,7 +485,7 @@ public final class ChannelSwapAudioDriver: ChannelSwapAudioDriving, @unchecked S
             Log.warn("声道交换：设置声道布局失败（\(CoreAudioHelpers.describe(status))），继续")
         }
 
-        // ★★ ChannelMap 必须**始终**设置（这里恒等）—— 依据结论文档 §5.2：
+        // ★★ ChannelMap 必须**始终**设置（这里恒等）—— 依据实测：
         //    不设置时 HAL 会丢弃部分声道（实测只播出 6 路）。
         //    ⚠️ 但它**不负责交换**：HALOutput 直通路径会忽略该属性，
         //       交换由渲染回调里的置换表完成（见文件头）。
@@ -497,7 +496,7 @@ public final class ChannelSwapAudioDriver: ChannelSwapAudioDriving, @unchecked S
         guard status == noErr else {
             throw SwapDriverError.propertyFailed("ChannelMap（不可省略）", status)
         }
-        // 回读校验：noErr 不代表生效（沿用 D3 纪律，只是这里无法再回读"是否真的换了"）
+        // 回读校验：noErr 不代表生效（只是这里无法再回读"是否真的换了"）
         var readBack = [Int32](repeating: -9, count: takeChannels)
         var size = UInt32(MemoryLayout<Int32>.size * takeChannels)
         status = AudioUnitGetProperty(u, kAudioOutputUnitProperty_ChannelMap,
@@ -586,7 +585,7 @@ public final class ChannelSwapAudioDriver: ChannelSwapAudioDriving, @unchecked S
             return noErr
         }
 
-        // ★ 必须调用 AudioUnitRender：输入回调的 ioData 不携带音频（结论 §2）
+        // ★ 必须调用 AudioUnitRender：输入回调的 ioData 不携带音频
         var timestamp = AudioTimeStamp()
         let status = AudioUnitRender(inputUnit!, nil, &timestamp, 1, UInt32(frames), abl)
         guard status == noErr else {

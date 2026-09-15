@@ -1,0 +1,77 @@
+name: Release
+
+# 发布流程：在 GitHub 上「发布新 Release」时触发，云端构建通用（arm64 + x86_64）
+# 二进制并打包 dmg，作为 asset 附加到该 Release。
+#
+# Release 的内容因此只有两样：GitHub 自动生成的源码归档（zip / tar.gz）+ dmg。
+# 仓库内不再存放任何构建产物（见 .gitignore 的 Dist/）。
+on:
+  release:
+    types: [published]
+  # 手动补跑：当某个 Release 的 dmg 构建失败、或需要重新出包时使用
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 要构建并附加 dmg 的 tag（例如 v0.1.0）
+        required: true
+        type: string
+
+# 上传 asset 需要写权限；其余一律不授权
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  dmg:
+    name: 通用 dmg（arm64 + x86_64）
+    runs-on: macos-latest
+
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      # GitHub Actions 的 macOS VM 没有虚拟音频设备（actions/runner-images#3526），
+      # 跳过 2 个依赖真实输出设备的用例，其余照跑。
+      TK_SKIP_AUDIO_HW_TESTS: "1"
+
+    steps:
+      - name: 检出该 tag 的源码
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+
+      - name: 工具链版本
+        run: |
+          swift --version
+          xcodebuild -version
+
+      - name: 缓存 SwiftPM 构建产物
+        uses: actions/cache@v4
+        with:
+          path: .build
+          key: ${{ runner.os }}-spm-universal-${{ hashFiles('Package.swift') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-universal-
+
+      # 质量门：测试不过就不出包，避免把坏版本发出去
+      - name: 运行单元测试
+        run: swift test
+
+      - name: 构建通用 App 并打包 dmg
+        run: Scripts/build_app.sh --universal
+
+      # 与 CI 使用同一个校验脚本，标准一致
+      - name: 校验产物（架构 / 签名 / dmg 内容）
+        run: Scripts/verify_app.sh
+
+      # README 的下载链接是 /releases/latest/download/TopologyKeeper.dmg，
+      # 依赖 asset 固定叫 TopologyKeeper.dmg（不带版本号），不要改名。
+      - name: 上传 dmg 到 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" Dist/TopologyKeeper.dmg --clobber
+          echo "已上传到 $TAG："
+          gh release view "$TAG" --json assets --jq '.assets[] | "\(.name)  \(.size) bytes"'

@@ -4,7 +4,7 @@ import Foundation
 /// `CoreAudioServiceProtocol` 的真实实现。
 ///
 /// **线程约定**：所有方法只在调用方指定的串行队列（`audioQueue`）上调用。
-/// CoreAudio 对同一对象的属性访问不是线程安全的，串行化是正确性要求而非优化（D12）。
+/// CoreAudio 对同一对象的属性访问不是线程安全的，串行化是正确性要求而非优化。
 /// 因此标记 `@unchecked Sendable`：安全性由调用方的队列纪律保证。
 public final class CoreAudioService: CoreAudioServiceProtocol, @unchecked Sendable {
 

@@ -55,6 +55,6 @@ public final class ChannelSwapEngine: ChannelSwapEngineable, @unchecked Sendable
 
     /// 设备**被销毁**（消失/重建前）时调用 —— 强制重建通路。
     ///
-    /// 依据（D7）：`AudioDeviceID` 每次重建都会变，绑定它的 AUHAL 单元随之失效。
+    /// 依据：`AudioDeviceID` 每次重建都会变，绑定它的 AUHAL 单元随之失效。
     public func devicesDisappeared() { supervisor.devicesDisappeared() }
 }

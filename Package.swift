@@ -5,7 +5,7 @@ import PackageDescription
 // 注意：本机只有 CommandLineTools，没有完整 Xcode，因此：
 //   * XCTest 不可用 → 测试使用 Swift Testing (`import Testing`)
 //   * 必须用 Scripts/test.sh 运行测试（需要额外的 -F/-rpath 指向 CLT 的 Testing.framework）
-// 详见 Scripts/env.sh 与《详细设计.md》§11。
+// 详见 Scripts/env.sh。
 let package = Package(
     name: "TopologyKeeper",
     platforms: [.macOS(.v13)],

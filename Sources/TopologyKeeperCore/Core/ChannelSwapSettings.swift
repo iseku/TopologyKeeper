@@ -15,7 +15,7 @@ import Foundation
 /// 这是**针对特定应用的补偿措施**，不是通用修正。
 /// 实测（用户以 Loopback 验证）：只对**原先中置/重低音错位**的应用有效
 /// （如 WOW、Movist Pro）；对本来布局就正确的应用（如 IINA、MPV）无影响
-/// —— 后者本身不需要修正。详见《探针结论-声道交换.md》§6.3。
+/// —— 后者本身不需要修正。
 public struct ChannelSwapSettings: Codable, Equatable, Hashable, Sendable {
 
     /// 总开关。关闭时引擎不启动、不占用任何音频设备
@@ -148,7 +148,7 @@ extension ChannelSwapSettings {
         self.retryBackoffMs = (try? c.decode([Int].self, forKey: .retryBackoffMs)) ?? d.retryBackoffMs
         self.notifyOnGiveUp = (try? c.decode(Bool.self, forKey: .notifyOnGiveUp)) ?? d.notifyOnGiveUp
         // ★ 新增字段一律 `?? 默认值` —— 否则**升级后整份配置读取失败**，
-        //   用户会以为设置全丢了（见本文件顶部说明与交接说明 §13-4）。
+        //   用户会以为设置全丢了（见本文件顶部说明）。
         self.mixEnabled = (try? c.decode(Bool.self, forKey: .mixEnabled)) ?? d.mixEnabled
         self.mixGainDB = (try? c.decode(Double.self, forKey: .mixGainDB)) ?? d.mixGainDB
         // 混音目标：**必须区分"没这个键"与"键存在但为 null"**

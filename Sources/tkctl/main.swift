@@ -33,8 +33,8 @@ func notifyAppToReload() {
 // tkctl —— 命令行诊断 / 验证工具。
 //
 // 用途：
-//   * M1：验证 CoreAudioService + FormatApplier 在真实硬件上的行为
-//   * M2：跑真实的睡眠/唤醒验证（不需要 UI）
+//   * 验证 CoreAudioService + FormatApplier 在真实硬件上的行为
+//   * 跑真实的睡眠/唤醒验证（不需要 UI）
 //   * 长期：出问题时的诊断入口
 //
 // 用法见 printUsage()。
@@ -162,7 +162,7 @@ func cmdApply(_ args: [String]) {
 
     let capability = service.capability(of: device.id)
     guard let entry = capability.entry(channels: channels, bitDepth: bits, sampleRate: rate) else {
-        // 这不是失败，而是"能力尚未就绪" —— 正确行为是等待下一次设备事件（D9）。
+        // 这不是失败，而是"能力尚未就绪" —— 正确行为是等待下一次设备事件。
         print("[等待] 组合 \(channels)ch/\(bits)bit/\(AudioFormatPreset.rateString(rate))Hz "
               + "当前不在能力清单中")
         print("   当前能力: \(capability.summary)")
@@ -193,7 +193,7 @@ func cmdApply(_ args: [String]) {
     }
 }
 
-// MARK: - lock：完整引擎，用于真实睡眠/唤醒验证（M2 核心验证）
+// MARK: - lock：完整引擎，用于真实睡眠/唤醒验证
 
 /// 运行时配置持有者（CLI 内规则基本不变，但用 holder 以便统一接口）
 final class CliConfigHolder: @unchecked Sendable {
@@ -461,7 +461,7 @@ func cmdClearConfig() {
     print("[成功] 已清除 App 配置")
 }
 
-// MARK: - agent：LaunchAgent 开机自启动（M5 / F2）
+// MARK: - agent：LaunchAgent 开机自启动
 
 func cmdAgent(_ args: [String]) {
     let sub = args.first ?? "status"

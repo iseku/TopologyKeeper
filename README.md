@@ -1,6 +1,6 @@
 # 🎵 TopologyKeeper
 
-[![macOS](https://img.shields.io/badge/macOS-13.0%2B-blue.svg)](https://developer.apple.com/macos/) [![Swift](https://img.shields.io/badge/Swift-6.0-orange.svg)](https://swift.org/) [![Tests](https://img.shields.io/badge/Tests-253%20passed-brightgreen)]() [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![macOS](https://img.shields.io/badge/macOS-13.0%2B-blue.svg)](https://developer.apple.com/macos/) [![Swift](https://img.shields.io/badge/Swift-6.0-orange.svg)](https://swift.org/) [![CI](https://github.com/iseku/TopologyKeeper/actions/workflows/ci.yml/badge.svg)](https://github.com/iseku/TopologyKeeper/actions/workflows/ci.yml) [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **保持你的音频输出格式**：睡眠唤醒后 HDMI/eARC 设备回落到 `2ch` 时，自动恢复为预设的 「声道数 · 位深 · 采样率」，不再需要每次手动打开「MIDI」进行设置。
 
@@ -14,10 +14,17 @@
 
 ## 🚀 快速开始
 
+> **系统要求**：macOS 13.0 或更高 · **通用二进制（Apple Silicon 与 Intel）**
+>
+> Release 中的安装包为 arm64 + x86_64 通用二进制，两种 Mac 均可直接运行。
+
 1. 下载：[TopologyKeeper.dmg（最新版）](https://github.com/iseku/TopologyKeeper/releases/latest/download/TopologyKeeper.dmg)
-2. 安装：打开DMG文件将`TopologyKeeper.app` 拖入 `Applications`
-3. 启动：打开启动台，点击 `TopologyKeeper` 应用（系统状态栏出现图标，如出现麦克风授权提醒请确认）
-4. 添加规则：点击状态栏图标 → 齿轮 → 「锁定规则」→ [+] 选择设备与目标格式
+2. 安装：打开 DMG，将 `TopologyKeeper.app` 拖入 `Applications`
+3. **首次打开需要手动放行**：本应用未使用 Apple 开发者证书签名，也未经过 Apple 公证，直接双击会被系统拦截，提示「无法打开，因为 Apple 无法检查其是否包含恶意软件」。任选一种方式放行：
+   - **图形界面**：打开「系统设置 → 隐私与安全性」，在底部找到关于 `TopologyKeeper` 的拦截提示，点击「仍要打开」，再确认一次。
+   - **命令行**：`xattr -dr com.apple.quarantine /Applications/TopologyKeeper.app`
+4. 启动：从启动台打开 `TopologyKeeper`（状态栏出现图标，如出现麦克风授权提醒请确认）
+5. 添加规则：点击状态栏图标 → 齿轮 → 「锁定规则」→ [+] 选择设备与目标格式
 
 > 使用`声道交换` / `LFE 混音`前，先安装 [BlackHole](https://github.com/ExistentialAudio/BlackHole)：`brew install blackhole-16ch`，然后重启系统并把系统默认音频设备选择为 `BlackHole 16ch` 。
 
@@ -29,20 +36,29 @@
 - 🔀 **声道交换** — 实时交换音频输出第 3 / 第 4 声道，修正「中置/低音炮」错误映射
 - 🔉 **LFE 混音** — 将LFE声道按可调增益混入中置声道，为没有独立低音炮的音响补充低频
 - ⚡ **实时处理** — 处理在实时音频回调中完成，非重采样、不写磁盘
-- 🛠 **命令行工具 `tkctl`** — 无需 GUI 即可管理规则、查看状态
+- 🛠 **命令行工具 `tkctl`** — 无需 GUI 即可管理规则、查看状态（需自行构建，不随 dmg 分发）
 
 
 
 ## 📦 自己编译
 
-**环境要求**：macOS 13+ · Xcode CommandLineTools（无需完整 Xcode）
+**环境要求**：macOS 13+ · **Swift 6 工具链**（Xcode 16 及以上的 CommandLineTools 即可，无需完整 Xcode）
+
+> 源码使用 Swift 6 语言模式（`swiftLanguageMode(.v6)`），工具链低于 6.0 会编译失败。
 
 ```bash
 git clone https://github.com/iseku/TopologyKeeper.git
 cd TopologyKeeper
-Scripts/build_app.sh          # 构建应用
+Scripts/build_app.sh          # 构建通用 App 并打包 dmg；产物：Dist/TopologyKeeper.app 与 Dist/TopologyKeeper.dmg
 open Dist/TopologyKeeper.app  # 测试运行
+Scripts/test.sh               # 运行单元测试
 ```
+
+> `build_app.sh` 默认构建 **arm64 + x86_64 通用二进制**（分别单架构编译后用 `lipo` 合并）；本地迭代想省一半时间可加 `--native`，只构建本机架构。
+>
+> 自行构建出的 App 同样是 ad-hoc 签名，本机运行不受影响；若要分发给他人，需要自行配置 Developer ID 签名与公证。
+>
+> 正式的 Release 包由 GitHub Actions 在发布新 Release 时自动构建并附加，仓库内不存放构建产物。
 
 
 
@@ -70,7 +86,17 @@ open Dist/TopologyKeeper.app  # 测试运行
 
 ⚡ 经测试，声道交换和混音功能不影响原先声道布局正确的软件，不会额外引入声道错乱。
 
-### 🛠 CLI命令
+### 🛠 命令行工具 tkctl
+
+> ⚠️ `tkctl` **不包含在 dmg 安装包内**，需要从源码构建后使用。
+
+```bash
+# 构建（产物：.build/spm/release/tkctl）
+Scripts/build.sh --product tkctl
+
+# 建议加入 PATH，之后即可直接调用 tkctl
+export PATH="$PWD/.build/spm/release:$PATH"
+```
 
 ```bash
 tkctl list                 # 列出输出设备

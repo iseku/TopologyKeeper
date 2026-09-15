@@ -8,7 +8,7 @@ import Foundation
 ///
 /// `bytesPerChannel` 默认为 `bits/8`（紧凑打包），
 /// 但真实设备常常用**更宽的容器** —— 实测 27C3A Pro 的 20bit/24bit
-/// 都是 4 字节/声道（32bit 容器），只有 16bit 是紧凑的 2 字节（§2.9）。
+/// 都是 4 字节/声道（32bit 容器），只有 16bit 是紧凑的 2 字节。
 /// 测试里必须能表达这种差异，否则测不出"照抄条目"这条纪律的价值。
 func makeASBD(channels: UInt32,
               bits: UInt32,
@@ -36,7 +36,7 @@ func makeASBD(channels: UInt32,
 
 /// 构造能力清单条目。
 /// `mSampleRateRange` 刻意做成**单点** —— 实测全部 193 条条目都是这样，
-/// 用它判断"支持的采样率区间"会得到错误结论（§2.9）。
+/// 用它判断"支持的采样率区间"会得到错误结论。
 func makeRanged(_ asbd: AudioStreamBasicDescription) -> AudioStreamRangedDescription {
     AudioStreamRangedDescription(
         mFormat: asbd,
@@ -104,9 +104,9 @@ final class MockCoreAudioService: CoreAudioServiceProtocol, @unchecked Sendable 
         case ignore
         /// 模式 B：返回 noErr，但**落到另一个格式**
         case landOn(AudioStreamBasicDescription)
-        /// F5：声道/位深生效，但采样率保持不变
+        /// 声道/位深生效，但采样率保持不变
         case dropSampleRate
-        /// F7：返回真实错误码
+        /// 返回真实错误码
         case fail(OSStatus)
         /// 多流场景：第一条流正常，其余流"写入被接受但不生效"
         case landOnChannelsAndBitsOnlyForSecondStream
@@ -114,7 +114,7 @@ final class MockCoreAudioService: CoreAudioServiceProtocol, @unchecked Sendable 
 
     var writeBehavior: WriteBehavior = .succeed
 
-    /// F5 重试路径：补设标称采样率是否有效（默认有效）
+    /// 重试路径：补设标称采样率是否有效（默认有效）
     var obeyNominalRateSet: Bool = true
 
     // MARK: 调用记录
@@ -331,7 +331,7 @@ final class MockCoreAudioService: CoreAudioServiceProtocol, @unchecked Sendable 
     // MARK: 设备重建（模拟唤醒时的 142 → 177 → 207 → 222）
 
     /// 模拟设备被销毁并重建：UID 不变，但 AudioDeviceID / AudioStreamID 全部改变。
-    /// 旧监听器随之失效 —— 这正是 D7 要求必须 re-arm 的原因（实测 §2.12）。
+    /// 旧监听器随之失效 —— 这正是必须 re-arm 的原因。
     func rebuildDevice(uid: String, newDeviceID: AudioDeviceID, newStreamID: AudioStreamID) {
         guard let index = devices.firstIndex(where: { $0.uid == uid }) else { return }
         guard let oldDeviceID = devices[safe: index]?.id else { return }

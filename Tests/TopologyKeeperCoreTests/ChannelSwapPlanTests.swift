@@ -2,7 +2,7 @@ import CoreAudio
 import Testing
 @testable import TopologyKeeperCore
 
-// 声道交换计划的纯逻辑测试（《探针结论-声道交换.md》§3）。
+// 声道交换计划的纯逻辑测试。
 //
 // 编号规范（用户要求）：**对外一律 1-based**（第 1…8 声道），
 //   与「音频MIDI设置」、电视/功放 UI 一致；只有写给 CoreAudio 的

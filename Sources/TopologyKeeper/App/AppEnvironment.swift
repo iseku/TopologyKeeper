@@ -4,10 +4,10 @@ import TopologyKeeperCore
 
 /// 依赖装配（DI 容器）。
 ///
-/// 线程纪律（《详细设计.md》§9.1）：
+/// 线程纪律：
 /// 所有 CoreAudio 交互收敛到**单一串行队列** `audioQueue`；
 /// `CoreAudioService` 的监听器回调也投递到该队列，
-/// 因此回调与其它工作天然有序，无需 `Task` 或 actor 重入处理（D12）。
+/// 因此回调与其它工作天然有序，无需 `Task` 或 actor 重入处理。
 final class AppEnvironment: @unchecked Sendable {
 
     let audioQueue = DispatchQueue(label: "com.iseku.topologykeeper.audio", qos: .userInitiated)

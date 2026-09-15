@@ -84,7 +84,7 @@ public protocol DeviceWatching: AnyObject, Sendable {
     var onEvent: (@Sendable (WatchEvent) -> Void)? { get set }
     func start()
     func stop()
-    /// 立即重新注册监听器（设备重建后必须调用，见 D7）
+    /// 立即重新注册监听器（设备重建后必须调用）
     func rearm()
     /// 当前已 armed 的设备（诊断用）
     var armedDescription: String { get }

@@ -99,7 +99,7 @@ final class AppState: ObservableObject {
         persistRuntimeDiagnostics(from: previous, to: new)
     }
 
-    /// 把运行时诊断写回配置，让重启后仍能看到上次结果（设计 §5.2 的字段）。
+    /// 把运行时诊断写回配置，让重启后仍能看到上次结果。
     ///
     /// 只在状态真正跃迁时写，避免每次评估都打 UserDefaults。
     private func persistRuntimeDiagnostics(from previous: [RuleSnapshot],
