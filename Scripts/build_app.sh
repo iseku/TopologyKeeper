@@ -64,8 +64,9 @@ codesign --force --deep --sign - "$APP"
 codesign --verify --verbose=2 "$APP" 2>&1 | sed 's/^/    /'
 
 echo "==> 4/5 打包 dmg"
-VERSION="$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" "$APP/Contents/Info.plist" 2>/dev/null || echo "0.0.0")"
-DMG="$DIST/$APP_NAME-$VERSION.dmg"
+# dmg 固定命名（不带版本号），配合 GitHub /releases/latest/download 永久链接，
+# README 无需随版本更新；版本信息由 Release 的 tag 承载
+DMG="$DIST/$APP_NAME.dmg"
 STAGE="$TK_ROOT/.build/dmg-staging"
 rm -rf "$STAGE" "$DMG"
 mkdir -p "$STAGE"

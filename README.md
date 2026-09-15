@@ -14,7 +14,7 @@
 
 ## 🚀 快速开始
 
-1. 下载：`TopologyKeeper-0.1.0.dmg`（或对应版本）
+1. 下载：[TopologyKeeper.dmg（最新版）](https://github.com/iseku/TopologyKeeper/releases/latest/download/TopologyKeeper.dmg)
 2. 安装：打开DMG文件将`TopologyKeeper.app` 拖入 `Applications`
 3. 启动：打开启动台，点击 `TopologyKeeper` 应用（系统状态栏出现图标，如出现麦克风授权提醒请确认）
 4. 添加规则：点击状态栏图标 → 齿轮 → 「锁定规则」→ [+] 选择设备与目标格式
