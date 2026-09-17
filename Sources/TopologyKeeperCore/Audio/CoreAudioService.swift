@@ -109,8 +109,53 @@ public final class CoreAudioService: CoreAudioServiceProtocol, @unchecked Sendab
             as: AudioStreamBasicDescription.self)
     }
 
+    /// 设备当前物理格式。
+    ///
+    /// ## ★ 多输出流设备：以"**全部流一致**"为准，而不是第一条流
+    ///
+    /// 这条口径必须与 `FormatApplier.apply` 完全对齐 —— 它**逐个写全部输出流**
+    /// （多流设备只改一条会留下"半套格式"，比不改更糟）。
+    /// 如果这里只看 `streams.first`，就会产生本项目最忌讳的**假锁定**：
+    /// `stream[0]` 已达标 ⇒ `RuleEngine` 的幂等检查短路成 `.locked`
+    /// ⇒ `stream[1..]` 永远不修，而日志与界面都显示"已锁定"。
+    ///
+    /// ⇒ 多流时任意一条流读不到、或与第一条**不完全相同**，就返回 `nil`
+    ///    （表达"还没到位"）。调用方会走"未就绪"分支并**继续重试**，
+    ///    这正是半套格式时想要的行为。
+    ///
+    /// 单流设备（绝大多数）行为完全不变，也不会多读一次属性。
     public func currentPhysicalFormat(ofDevice device: AudioDeviceID) -> AudioStreamBasicDescription? {
-        outputStreams(of: device).first.flatMap { currentPhysicalFormat(of: $0) }
+        let streams = outputStreams(of: device)
+        guard let first = streams.first,
+              let reference = currentPhysicalFormat(of: first) else { return nil }
+
+        guard streams.count > 1 else { return reference }
+
+        for stream in streams.dropFirst() {
+            guard let other = currentPhysicalFormat(of: stream),
+                  Self.formatsAreIdentical(reference, other) else { return nil }
+        }
+        return reference
+    }
+
+    /// 两个物理格式是否**逐字段完全相同**。
+    ///
+    /// 抽成静态方法有两个目的：① 让"多流一致性"的判据可以被单测直接钉住
+    /// （不依赖任何 CoreAudio 对象）；② 与 `FormatApplier` 共用同一套字段清单，
+    /// 避免两处各自列字段、日后加字段时漏改一处而重新出现"半套格式被判为达标"。
+    ///
+    /// ⚠️ 刻意**不用** `AudioFormatPreset.matchesCurrent`：那个是"是否达到用户
+    ///    目标组合"（只看声道/位深/采样率），而这里要的是"各流是否彼此一致"。
+    ///    两者口径不同，混用会让"两条流都错但错得一样"被判成未就绪或反之。
+    public static func formatsAreIdentical(_ a: AudioStreamBasicDescription,
+                                           _ b: AudioStreamBasicDescription) -> Bool {
+        a.mSampleRate == b.mSampleRate
+            && a.mFormatID == b.mFormatID
+            && a.mFormatFlags == b.mFormatFlags
+            && a.mChannelsPerFrame == b.mChannelsPerFrame
+            && a.mBitsPerChannel == b.mBitsPerChannel
+            && a.mBytesPerFrame == b.mBytesPerFrame
+            && a.mBytesPerPacket == b.mBytesPerPacket
     }
 
     public func nominalSampleRate(of device: AudioDeviceID) -> Double? {

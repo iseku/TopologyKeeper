@@ -277,12 +277,16 @@ struct LfeMixTransferTests {
     ///   · target = CH-O（下游）
     ///   · direct = **与 CH-I 不同**的那条输入（两条输入都进 CH-O）
     ///   · cut    = 与 CH-O 不同的那条下游
+    /// 期望接线（**production 同源**：直接调用 `LfeMixPlan` 的纯函数，
+    /// 不再在本文件里复制一遍"取配对中另一条"的推导）。
+    ///
+    /// 历史：这里曾自己抄一份 `other()`，且注释与驱动注释互相矛盾，
+    /// 结果被一次外部审计误读成"驱动与展示不一致"的功能缺陷。
+    /// 现在四处（驱动 / 展示 / 本文件 / tkctl）共用同一实现。
     private func wiring(inputChannel: Int, outputChannel: Int) -> (target: Int, direct: Int, cut: Int) {
-        let pair = LfeMixPlan.selectableChannels
-        let other = { (ch: Int) in ch == pair.lowerBound ? pair.upperBound : pair.lowerBound }
-        return (target: outputChannel - 1,
-                direct: other(inputChannel) - 1,
-                cut: other(outputChannel) - 1)
+        (target: outputChannel - 1,
+         direct: LfeMixPlan.directInputChannel(forSource: inputChannel) - 1,
+         cut: LfeMixPlan.cutOutputChannel(forTarget: outputChannel) - 1)
     }
 
     @Test("M7a 用例①　CH-O=4, CH-I=3 → CH4-O = CH4-I + CH3-I × gain")
@@ -309,10 +313,14 @@ struct LfeMixTransferTests {
 
     @Test("M7c 用例③　CH-O=3, CH-I=3 → CH3-O = CH4-I + CH3-I × gain（直通的是 CH4-I！）")
     func case3() {
-        // ⚠️ 这正是先前错的一组：直通的输入由 **CH-O** 决定，不是由 CH-I 决定。
-        // CH-O=3, CH-I=3 ⇒ 直通的输入 = 与 CH-I 不同的那条 = CH4-I（索引 3）
+        // ★ 直通的输入由 **CH-I**（上游空间）决定，不是由 CH-O 决定。
+        //   CH-I=3 ⇒ 直通那条 = 与 CH-I 配对的另一条 = CH4-I（索引 3）。
+        //   （旧注释写的"由 CH-O 决定"是错的，与 M7d2 的注释互相矛盾 ——
+        //     两条注释打架正是 `other()` 被抄成 4 份时的产物，现已收口到
+        //     `LfeMixPlan.directInputChannel/cutOutputChannel` 一处实现。）
         let w = wiring(inputChannel: 3, outputChannel: 3)
         #expect(w.direct == 3, "CH-I=3 时直通的输入必须是 CH4-I（索引 3）")
+        // 「不连的下游」才由 CH-O 决定：CH-O=3 ⇒ 配对里另一条下游 = CH4-O（索引 3）
         #expect(w.cut == 3, "CH-O=3 时不连的下游是 CH4-O（索引 3）")
         let gain = LfeMixPlan.gain(fromDB: LfeMixPlan.defaultGainDB)
         let out = LfeMixPlan.outputSample(outputChannelIndex: 2, contentSample: 0.5,
@@ -331,20 +339,77 @@ struct LfeMixTransferTests {
         #expect(abs(out - (1.0 + 0.5 * 0.3162)) < 1e-3, "实际 \(out)")
     }
 
-    @Test("M7d2 回归：direct 由 **CH-I** 决定、cut 由 **CH-O** 决定（我搞混过一次）")
+    @Test("M7d2 回归：direct 由 **CH-I** 决定、cut 由 **CH-O** 决定（两个空间别搞混）")
     func directComesFromInputCutFromOutput() {
         // 曾经写成 `direct = other(outputChannel)`：于是 CH-I=3 时"直通"算成 CH3-I 自己，
         // CH4-I 根本没进 CH-O。用户实测："CH4-I 直通 CH4-O"而非混入。
+        //
+        // ★ 这里改成直接断言**两个纯函数**的语义（而不是再算一遍配对），
+        //   这样本文件不再持有第二份实现 —— 四处共用的收口点见 LfeMixPlan。
         let pair = LfeMixPlan.selectableChannels
         for outCh in pair {
             for inCh in pair {
-                let w = wiring(inputChannel: inCh, outputChannel: outCh)
-                #expect(w.direct == (inCh == pair.lowerBound ? pair.upperBound : pair.lowerBound) - 1,
+                let expectedDirect = (inCh == pair.lowerBound ? pair.upperBound : pair.lowerBound)
+                let expectedCut = (outCh == pair.lowerBound ? pair.upperBound : pair.lowerBound)
+
+                #expect(LfeMixPlan.directInputChannel(forSource: inCh) == expectedDirect,
                         "直通输入应由 CH-I=\(inCh) 决定")
-                #expect(w.cut == (outCh == pair.lowerBound ? pair.upperBound : pair.lowerBound) - 1,
+                #expect(LfeMixPlan.cutOutputChannel(forTarget: outCh) == expectedCut,
                         "不连下游应由 CH-O=\(outCh) 决定")
+
+                // 并且 harness 的接线与两个纯函数一致（证明测试没有自己另算一套）
+                let w = wiring(inputChannel: inCh, outputChannel: outCh)
+                #expect(w.direct == expectedDirect - 1)
+                #expect(w.cut == expectedCut - 1)
             }
         }
+    }
+
+    @Test("M7h ★ 四组配置下「展示文案」与「驱动接线」必须逐字一致（回归：曾误判为不一致）")
+    func displayMatchesWiringForAllFourCombinations() {
+        // 背景：一次外部审计据此文件与驱动的注释判定"驱动按 CH-I 算、展示按 CH-O 算，
+        // 两处矛盾、一半配置无声"。实际两处**代码**一直一致（都用 CH-I），
+        // 矛盾只存在于注释里。这条用例把"四组组合下展示 = 接线"钉死，
+        // 以后任何一侧改动都会立刻暴露。
+        let gain = LfeMixPlan.gain(fromDB: LfeMixPlan.defaultGainDB)
+        let pair = LfeMixPlan.selectableChannels
+
+        for outCh in pair {
+            for inCh in pair {
+                let w = wiring(inputChannel: inCh, outputChannel: outCh)
+                // 展示文案里的那两个声道号（从字符串里取，而不是再算一遍）
+                let line = LfeMixPlan.transferFunctionLine(inputChannel: inCh,
+                                                            outputChannel: outCh,
+                                                            gain: gain)
+                let expected = "CH\(outCh)-O = CH\(w.direct + 1)-I + CH\(inCh)-I × "
+                    + String(format: "%.3f", gain)
+                #expect(line == expected,
+                        "CH-I=\(inCh)/CH-O=\(outCh) 的展示文案与接线不一致：\(line)")
+
+                // ★ 直通那条**绝不能**等于被衰减那条（那会变成 (1+g)× 自混）
+                #expect(w.direct != inCh - 1,
+                        "CH-I=\(inCh) 时直通声道不能是被衰减的自己（自混）")
+                // ★ 不连的那条**绝不能**等于目标（否则会把目标静音）
+                #expect(w.cut != w.target,
+                        "CH-O=\(outCh) 时不连的下游不能是目标本身")
+            }
+        }
+    }
+
+    @Test("M7i ★ 配对推导纯函数是唯一出处：越界输入也取配对的另一条（不回落到自身）")
+    func pairedCounterpartIsTotalAndNeverSelf() {
+        let pair = LfeMixPlan.selectableChannels
+        for ch in pair {
+            #expect(LfeMixPlan.pairedCounterpart(of: ch) != ch, "配对另一条不得是自身")
+            #expect(pair.contains(LfeMixPlan.pairedCounterpart(of: ch)))
+            // 两次取另一条应回到自身（对合性）
+            #expect(LfeMixPlan.pairedCounterpart(of: LfeMixPlan.pairedCounterpart(of: ch)) == ch)
+        }
+        // 两个空间的入口各自代表不同语义，但都落到同一个对合运算
+        #expect(LfeMixPlan.directInputChannel(forSource: 3)
+                == LfeMixPlan.pairedCounterpart(of: 3))
+        #expect(LfeMixPlan.cutOutputChannel(forTarget: 4)
+                == LfeMixPlan.pairedCounterpart(of: 4))
     }
 
     @Test("M7e 不连的那条下游声道静音（CH-O=4 → CH3-O；CH-O=3 → CH4-O）")

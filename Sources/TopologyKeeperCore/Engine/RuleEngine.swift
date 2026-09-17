@@ -59,6 +59,38 @@ public final class RuleEngine: @unchecked Sendable {
     private var pollGeneration: UInt64 = 0
     private var started = false
 
+    /// 唯一的队列身份标识，用于判断"我是否已经在该队列上"。
+    ///
+    /// ## 为什么必须有（这是一次真实的并发缺陷）
+    ///
+    /// `snapshots` / `lastLockedRuleIDs` / `started` / 统计量都是**无锁**的普通属性，
+    /// 本类全部状态都**只允许在 `queue` 上**读写。但公开动作入口
+    /// （`start` / `applyNow` / `refreshSnapshots` / `configDidChange` / `stop`）
+    /// 之前是**裸同步执行**的 —— 是否在正确队列上全靠调用方自觉。
+    /// 实测被踩破：`tkctl lock` 在主线程直接调 `engine.start()`
+    /// （`Sources/tkctl/main.swift`），于是首次评估里对
+    /// `snapshots` / `policy` / `lastLockedRuleIDs` 的写入落在主线程，
+    /// 与 `audioQueue` 上的防抖评估并发 —— Swift 字典并发 mutate 是 UB。
+    ///
+    /// ⇒ 现在用派发键把队列纪律**做进本体**（与 `ChannelSwapSupervisor.queueKey`
+    ///    同一套方案，那层已经这么做且从未出过问题）。
+    private static let queueKey = DispatchSpecificKey<UInt8>()
+
+    /// 在 `queue` 上执行；**若已在该队列上则直接执行**（避免自死锁）。
+    ///
+    /// 注意这里是 `async` 而不是 `sync`：公开入口都不返回数据，
+    /// 而 `sync` 会在调用方与队列之间引入等待（主线程 `sync` 到正在做
+    /// CoreAudio 写入的队列 = UI 卡顿）。派发顺序仍由串行队列保证。
+    @inline(__always)
+    private func onQueue(_ body: @escaping @Sendable () -> Void) {
+        if DispatchQueue.getSpecific(key: Self.queueKey) != nil {
+            body()
+        } else {
+            Log.debug("RuleEngine：动作不在 audioQueue 上调用，已代为派发（调用方应自行收口）")
+            queue.async(execute: body)
+        }
+    }
+
     /// 评估次数统计（测试与诊断用）
     public private(set) var evaluationCount = 0
     /// 实际写入次数统计（测试用：验证"不该写时一次都不写"）
@@ -79,6 +111,8 @@ public final class RuleEngine: @unchecked Sendable {
         self.queue = queue
         self.pollExecutor = pollExecutor
         self.applier = FormatApplier(service: service)
+        // ★ 打上队列身份标记，供 `onQueue` 判断"是否已在正确队列上"
+        queue.setSpecific(key: Self.queueKey, value: 1)
     }
 
     /// 仅测试用：替换睡眠观察器（真实实现带看门狗，mock 没有）
@@ -86,9 +120,24 @@ public final class RuleEngine: @unchecked Sendable {
         self.sleepWake = observer
     }
 
+    /// 仅测试用：直接触发"唤醒后兜底轮询"的排程。
+    ///
+    /// 存在的原因：`beginPostWakePolling` 由 `sleepWake.onWake` 驱动，
+    /// 而测试里注入的是**同步**执行器（`immediateExecutor`）—— 直接走唤醒路径
+    /// 会因 `schedulePoll` 的无条件自续而变成无限递归。
+    /// 这个入口让测试可以注入"只记录不执行"的执行器，从而观察**首次投递的间隔**。
+    public func beginPostWakePollingForTesting() {
+        beginPostWakePolling()
+    }
+
     // MARK: - 生命周期
 
     public func start() {
+        onQueue { [weak self] in self?.startLocked() }
+    }
+
+    /// 实际的启动逻辑（**必须在 `queue` 上执行**）
+    private func startLocked() {
         guard !started else { return }
         started = true
 
@@ -126,6 +175,11 @@ public final class RuleEngine: @unchecked Sendable {
     }
 
     public func stop() {
+        onQueue { [weak self] in self?.stopLocked() }
+    }
+
+    /// 实际的停止逻辑（**必须在 `queue` 上执行**）
+    private func stopLocked() {
         guard started else { return }
         started = false
         watcher.stop()
@@ -164,7 +218,17 @@ public final class RuleEngine: @unchecked Sendable {
     /// 手动"立即应用"（单条规则）。
     ///
     /// 会清掉抑制窗口与退避 —— 用户按下按钮是明确指令，应当立即生效。
+    ///
+    /// ⚠️ 本方法与下面几个动作入口**刻意不判 `started`**：
+    ///    单测会在未 `start()` 时驱动它们来验证评估逻辑（如 T19g），
+    ///    而且 `configDidChange` 早于 `start()` 到达是合法的。
+    ///    "停止后不许再碰设备"由**真正的危险点**兜住 —— 见
+    ///    `DeviceWatcher.rearm()` 里的 `started` 守卫（那才是会注册监听器的地方）。
     public func applyNow(ruleID: UUID) {
+        onQueue { [weak self] in self?.applyNowLocked(ruleID: ruleID) }
+    }
+
+    private func applyNowLocked(ruleID: UUID) {
         guard let rule = configProvider().rules.first(where: { $0.id == ruleID }) else { return }
         policy.clearBackoff(ruleID)
         evaluate(rule: rule, trigger: .manual, bypassSuppression: true)
@@ -173,6 +237,10 @@ public final class RuleEngine: @unchecked Sendable {
 
     /// 手动"立即应用全部"
     public func applyAllNow() {
+        onQueue { [weak self] in self?.applyAllNowLocked() }
+    }
+
+    private func applyAllNowLocked() {
         let rules = configProvider().rules.filter(\.isEnabled)
         for rule in rules {
             policy.clearBackoff(rule.id)
@@ -187,6 +255,10 @@ public final class RuleEngine: @unchecked Sendable {
     /// 触发类型用 `.inPlaceChange`：这属于"顺带检查"，
     /// 对 `onConnectOnly` 策略的规则不应算作"接入"。
     public func refreshSnapshots() {
+        onQueue { [weak self] in self?.refreshSnapshotsLocked() }
+    }
+
+    private func refreshSnapshotsLocked() {
         watcher.rearm()                       // ★ 受监控集合可能变了（见 configDidChange）
         evaluateAll(trigger: .inPlaceChange)
     }
@@ -201,11 +273,18 @@ public final class RuleEngine: @unchecked Sendable {
     /// 2. 以 `.manual` 立即评估 —— 用户刚添加规则就是明确意图，应当马上生效，
     ///    而不是等下一次设备事件（那可能是几小时后的唤醒）。
     public func configDidChange() {
+        onQueue { [weak self] in self?.configDidChangeLocked() }
+    }
+
+    private func configDidChangeLocked() {
         Log.info("配置已变更（共 \(configProvider().rules.count) 条规则），重新注册监听器并立即评估")
         watcher.rearm()
         evaluateAll(trigger: .manual)
     }
 
+    /// 当前全部规则的快照（按配置顺序）。
+    ///
+    /// ⚠️ 只允许在 `queue` 上调用；目前仅测试与引擎内部使用。
     public func currentSnapshots() -> [RuleSnapshot] {
         configProvider().rules.compactMap { snapshots[$0.id] }
     }
@@ -239,9 +318,25 @@ public final class RuleEngine: @unchecked Sendable {
         let descriptor = resolved.descriptor
 
         // ── 3. 读当前格式 ───────────────────────────────────────
+        //
+        // ⚠️ 读失败**不等于"设备不见了"**：设备已解析成功（上面刚拿到 descriptor），
+        //    这里的失败更可能是
+        //      · 瞬时读取失败（单次 `AudioObjectGetPropertyData`，无重试），或
+        //      · **多输出流设备的各流格式不一致**（见
+        //        `CoreAudioService.currentPhysicalFormat(ofDevice:)`）。
+        //    此前一律报 `.deviceAbsent`（文案"未连接"），于是
+        //      · 界面会闪出"未连接"而设备其实在，且 `devicePresent` 仍为 true
+        //        —— 自相矛盾的显示；
+        //      · 多流半套格式被显示成"设备没插"，真实原因被彻底隐藏。
+        //    ⇒ 改为报 `.waitingForCapability`（文案"等待设备就绪"），
+        //      语义准确，且 UI 会持续重试而不是让人以为设备掉了。
         guard let currentASBD = service.currentPhysicalFormat(ofDevice: descriptor.id) else {
-            report(rule, state: .deviceAbsent, descriptor: descriptor,
-                   matchedViaFallback: resolved.viaFallback)
+            let capability = service.capability(of: descriptor.id)
+            report(rule, state: .waitingForCapability(
+                        availableMaxChannels: capability.maxChannelCount),
+                   descriptor: descriptor,
+                   matchedViaFallback: resolved.viaFallback,
+                   capability: capability)
             return
         }
         let currentFormat = AudioFormatPreset(asbd: currentASBD)
@@ -516,12 +611,47 @@ public final class RuleEngine: @unchecked Sendable {
         pollGeneration &+= 1
         let generation = pollGeneration
         let config = configProvider()
-        let deadline = Date().addingTimeInterval(Double(config.postWakePollDurationMs) / 1000)
-        Log.info("唤醒后兜底轮询：每 \(config.postWakePollIntervalMs)ms 一次，"
-                 + "持续 \(config.postWakePollDurationMs / 1000) 秒")
+
+        // ★ 间隔必须钳制下限。
+        //
+        //   `postWakePollIntervalMs` 是设置页里一个**无校验的整数输入框**
+        //   （`SettingsRootView.intField` → 直接写进配置），用户可以填 0 或负数。
+        //   而 `schedulePoll` 是**无条件自续**的：
+        //       executor(intervalMs) { … ; schedulePoll(…) }
+        //   配上 `makeQueueExecutor` = `queue.asyncAfter(now + ms)`，
+        //   `intervalMs ≤ 0` 就退化成"尽快反复投递" —— 实测
+        //   `asyncAfter(.now() + .milliseconds(-5))` **仍会执行**（不会报错、
+        //   也不会变成"不投递"），于是整个 `postWakePollDurationMs`
+        //   （默认 60 秒）期间 audioQueue 被持续灌满，并烧满一个核，
+        //   同时显著抬高所有 CoreAudio 工作的排队延迟。
+        //
+        //   下限取 100ms：正常值 2000ms，100ms 已经比"有用"快 20 倍，
+        //   但仍能把每轮开销限制在可接受范围。
+        let rawInterval = config.postWakePollIntervalMs
+        let intervalMs = max(rawInterval, Self.minimumPostWakePollIntervalMs)
+        if intervalMs != rawInterval {
+            Log.warn("唤醒后轮询间隔 \(rawInterval)ms 非法（必须 ≥ "
+                     + "\(Self.minimumPostWakePollIntervalMs)ms），已钳制为 \(intervalMs)ms")
+        }
+        // 时长同理：≤0 会让 deadline 落在过去，轮询一次都不跑（无害但应说明）
+        let rawDuration = config.postWakePollDurationMs
+        let durationMs = max(rawDuration, intervalMs)
+        if durationMs != rawDuration {
+            Log.warn("唤醒后轮询时长 \(rawDuration)ms 非法（必须 ≥ 间隔 \(intervalMs)ms），"
+                     + "已钳制为 \(durationMs)ms")
+        }
+
+        let deadline = Date().addingTimeInterval(Double(durationMs) / 1000)
+        Log.info("唤醒后兜底轮询：每 \(intervalMs)ms 一次，"
+                 + "持续 \(durationMs / 1000) 秒")
         schedulePoll(generation: generation, deadline: deadline,
-                     intervalMs: config.postWakePollIntervalMs, executor: pollExecutor)
+                     intervalMs: intervalMs, executor: pollExecutor)
     }
+
+    /// 唤醒后兜底轮询的最小间隔（毫秒）。见 `beginPostWakePolling` 的说明。
+    /// 取值依据：正常配置 2000ms；钳到 100ms 仍远快于"能力到位需要 19~28 秒"
+    /// 这个真实节奏，同时杜绝 `asyncAfter(0)` 式的忙循环。
+    static let minimumPostWakePollIntervalMs = 100
 
     private func schedulePoll(generation: UInt64,
                               deadline: Date,

@@ -294,8 +294,9 @@ func cmdLock(_ args: [String]) {
     print("现在可以睡眠 / 唤醒这台 Mac，观察是否自动恢复。Ctrl-C 退出。")
     print(String(repeating: "-", count: 78))
 
-    let formatter = DateFormatter()
-    formatter.dateFormat = "HH:mm:ss.SSS"
+    // ★ 与落盘日志、App 面板**同一格式**（含 MM-dd 日期）：跨天时只留
+    //   HH:mm:ss 会让前后两天看起来像同一天。格式统一走 `LogEntry.timestamp(for:)`，
+    //   避免 tkctl 自带一个 DateFormatter 后与 App 漂移。
 
     // 状态变化时打印（在 audioQueue 回调，hop 到 main 输出）
     let previousStates = Collector2<UUID, LockState>()
@@ -306,7 +307,7 @@ func cmdLock(_ args: [String]) {
                 guard previous != snapshot.state else { continue }
                 previousStates.set(snapshot.state, for: snapshot.ruleID)
 
-                let time = formatter.string(from: Date())
+                let time = "[\(LogEntry.timestamp(for: Date()))]"
                 print("[\(time)] 状态 \(previous.map { "\($0.displayText) → " } ?? "")"
                       + "\(snapshot.state.displayText)")
                 print("           预设 \(snapshot.preset.displayString)"
@@ -324,16 +325,24 @@ func cmdLock(_ args: [String]) {
     heartbeat.setEventHandler {
         let current = service.currentPhysicalFormat(ofDevice: device.id)
         let target = preset.matchesCurrent(current ?? AudioStreamBasicDescription())
-        print("[\(formatter.string(from: Date()))] · 心跳 | 当前 "
+        print("[\(LogEntry.timestamp(for: Date()))] · 心跳 | 当前 "
               + "\(current.map(CoreAudioHelpers.describeShort) ?? "设备不在")"
               + " | \(target ? "已是目标格式" : "与目标不一致（守护应正在处理）")")
     }
     heartbeat.resume()
 
-    engine.start()
-
-    // 全局队列上启动引擎，然后进入主线程事件循环
+    // ★ 必须在引擎自己的串行队列上启动（`queue` = 传给 RuleEngine 的同一个队列）。
+    //
+    //   此前这里是**裸调** `engine.start()`，于是首次 `evaluateAll` 里对
+    //   `snapshots` / `policy` / `lastLockedRuleIDs` 的写入全部落在**主线程**，
+    //   而上面那个 `heartbeat`（.main）同时读设备格式、watcher 的回调又在
+    //   `queue` 上跑 —— 同一批可变状态被两条线程读写，Swift 字典并发 mutate
+    //   是 UB。注释写的是"全局队列上启动引擎"，实现却是主线程裸调，两者相反。
+    //
+    //   `RuleEngine` 自身现在也会把非队列上的调用代为派发（见其 `onQueue`），
+    //   这里显式收口是为了不在日志里留下"动作不在 audioQueue 上调用"的告警。
     queue.async {
+        engine.start()
         Log.info("引擎启动完成")
     }
     dispatchMain()
@@ -748,14 +757,13 @@ private func mixShow() {
     if let r = plan.resolved() {
         // ★ 把完整接线画出来 —— 这是本功能的核心，纯文字描述最容易误解。
         //   规律（4 组实测用例确认）：
-        //     · 直通的输入 = 与 CH-O **不同**的那条输入
-        //     · 不连的下游 = 与 CH-O **不同**的那条下游
+        //     · 直通的输入 = 与 **CH-I**（上游）配对的那条输入
+        //     · 不连的下游 = 与 **CH-O**（下游）配对的那条输出
         //     · 衰减施加在用户选中的那条 CH-I 上
+        //   （两个空间不同，参数名必须显式区分 —— 见 LfeMixPlan 的纯函数）
         let g = String(format: "%.3f", r.gain)
-        let pair = LfeMixPlan.selectableChannels
-        let other = { (ch: Int) in ch == pair.lowerBound ? pair.upperBound : pair.lowerBound }
-        let direct = other(r.inputChannel)    // 直通的输入：与 CH-I 不同的那条
-        let cut = other(r.outputChannel)      // 不连的下游：与 CH-O 不同的那条
+        let direct = LfeMixPlan.directInputChannel(forSource: r.inputChannel)
+        let cut = LfeMixPlan.cutOutputChannel(forTarget: r.outputChannel)
         print("     * 接线：")
         print("        CH\(r.inputChannel)-I ──[× \(g)]──* CH\(r.outputChannel)-O   （选中的那条：衰减）")
         print("        CH\(direct)-I ──────────────* CH\(r.outputChannel)-O   （直通，不衰减）")
@@ -765,9 +773,9 @@ private func mixShow() {
               + "CH\(direct)-I + CH\(r.inputChannel)-I × \(g)")
         // ★ 把**实际索引**写清楚：排查时直接与 PLVS 的通道号对照，不靠名称推断
         let rateIdx = r.inputAPIIndex
-        let directIdx = other(r.inputChannel) - 1
+        let directIdx = ChannelSwapPlan.apiIndex(forChannel: direct)
         let targetIdx = r.outputAPIIndex
-        let cutIdx = other(r.outputChannel) - 1
+        let cutIdx = ChannelSwapPlan.apiIndex(forChannel: cut)
         print("     → 实际索引：读 plane[\(rateIdx)]（衰减那条） + plane[\(directIdx)]（直通那条）"
               + "  →  写 output[\(targetIdx)]")
         print("       output[\(cutIdx)] = 0；其余 output 原样")
@@ -885,15 +893,12 @@ private func mixMonitor(seconds: Double) {
     print("\n混音监视 \(Int(seconds)) 秒：\(mix.description)")
     print("  * 请**另开终端播放音乐**，然后看下面哪条 CHn-O 有电平")
     if let declared { print("  设备声明：\(CoreAudioHelpers.describe(declared))") }
-    let other = { (ch: Int) in
-        ch == LfeMixPlan.selectableChannels.lowerBound
-            ? LfeMixPlan.selectableChannels.upperBound
-            : LfeMixPlan.selectableChannels.lowerBound
-    }
-    let directCh = other(mix.inputChannel)
+    // ★ 配对推导走 `LfeMixPlan` 的纯函数（与驱动、展示、单测同一出处）
+    let directCh = LfeMixPlan.directInputChannel(forSource: mix.inputChannel)
+    let cutCh = LfeMixPlan.cutOutputChannel(forTarget: mix.outputChannel)
     print("  预期：CH\(mix.outputChannel)-O = CH\(directCh)-I + CH\(mix.inputChannel)-I × "
           + String(format: "%.3f", mix.gain))
-    print("        CH\(other(mix.outputChannel))-O = 0（不连）")
+    print("        CH\(cutCh)-O = 0（不连）")
     do {
         _ = try driver.start(plan: identity, input: input, output: output,
                              outputIsSystemDefault: (r.defaultOutputDevice()?.uid == output.uid),
@@ -922,7 +927,7 @@ private func mixMonitor(seconds: Double) {
     }
     print("\n判读：")
     print("  · CH\(mix.outputChannel)-O 应明显大于 0（有输出）")
-    print("  · CH\(other(mix.outputChannel))-O 应为 0（不连）")
+    print("  · CH\(cutCh)-O 应为 0（不连）")
     print("  · 其余 CHn-O 应与不放音乐时一致（直通，峰值为 0 说明该路本来就没内容）")
 }
 
@@ -948,10 +953,10 @@ private func mixVerify(seconds: Double) {
     guard let mix = plan.resolved() else {
         print("[失败] 混音计划不可用：\(plan.unavailableReason ?? "参数不合法")"); return
     }
-    let pair = LfeMixPlan.selectableChannels
-    let other = { (ch: Int) in ch == pair.lowerBound ? pair.upperBound : pair.lowerBound }
-    let directCh = other(mix.inputChannel)
-    let cutCh = other(mix.outputChannel)
+    // ★ 配对推导走 `LfeMixPlan` 的纯函数（与驱动、展示、单测同一出处），
+    //   不再在本文件复制一遍"取配对中另一条"。
+    let directCh = LfeMixPlan.directInputChannel(forSource: mix.inputChannel)
+    let cutCh = LfeMixPlan.cutOutputChannel(forTarget: mix.outputChannel)
     let expected = 0.5 + 0.5 * Double(mix.gain)
 
     print("\n混音客观验证（用合成序列，无需播放内容）")
@@ -1146,12 +1151,13 @@ private func swapRun(seconds: Double) {
     if let m = mixResolved {
         // 与 mix show / UI 用**同一套规则**生成描述，避免三处文字各自漂移
         // （"手写说明与实现不一致"这几轮已经坑过两次）
-        let pair = LfeMixPlan.selectableChannels
-        let other = { (ch: Int) in ch == pair.lowerBound ? pair.upperBound : pair.lowerBound }
         let g = String(format: "%.3f", m.gain)
+        // 配对推导统一走 LfeMixPlan 的纯函数（唯一出处）
+        let directCh = LfeMixPlan.directInputChannel(forSource: m.inputChannel)
+        let cutCh = LfeMixPlan.cutOutputChannel(forTarget: m.outputChannel)
         print("  * LFE 混音: \(m.description)")
-        print("     CH\(m.outputChannel)-O = CH\(other(m.inputChannel))-I + CH\(m.inputChannel)-I × \(g)")
-        print("     CH\(other(m.outputChannel))-O = 0（不连）")
+        print("     CH\(m.outputChannel)-O = CH\(directCh)-I + CH\(m.inputChannel)-I × \(g)")
+        print("     CH\(cutCh)-O = 0（不连）")
     }
     do {
         let map = try driver.start(plan: plan, input: input, output: output,

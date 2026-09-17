@@ -142,13 +142,16 @@ final class FakeClock: @unchecked Sendable {
 final class EngineHarness: @unchecked Sendable {
 
     let queue = DispatchQueue(label: "test.audio.queue")
-    let service = MockCoreAudioService()
-    let watcher = MockDeviceWatcher()
-    let sleepWake = MockSleepWakeObserver()
+    /// ⚠️ 这几个是 `var` 而不是 `let`：`replaceService` 会整体重建
+    ///    service + watcher + sleepWake + policy + engine（`RuleEngine` 在 init
+    ///    里就绑定了它们，多流设备等场景必须"先摆好设备状态再建引擎"）。
+    private(set) var service = MockCoreAudioService()
+    private(set) var watcher = MockDeviceWatcher()
+    private(set) var sleepWake = MockSleepWakeObserver()
     let config: ConfigHolder
     let clock: FakeClock
-    let policy: ApplyPolicy
-    let engine: RuleEngine
+    private(set) var policy: ApplyPolicy
+    private(set) var engine: RuleEngine
 
     private(set) var snapshots: [RuleSnapshot] = []
 
@@ -179,6 +182,38 @@ final class EngineHarness: @unchecked Sendable {
 
     func start() {
         queue.sync { engine.start() }
+    }
+
+    /// ★ 用一台**已经摆好设备状态**的 service 重建整套 harness 组件。
+    ///
+    /// 存在的原因：`RuleEngine` 在 `init` 里就绑定了 service/watcher/sleepWake，
+    /// 而多流设备等场景必须"先把 `streamsByDevice` 摆好、再建引擎"。
+    /// 这里保留同一个 `queue`/`config`/`clock`（测试后续仍用同一套），
+    /// 只替换底层 service/watcher/sleepWake/policy/engine。
+    func replaceService(_ newService: MockCoreAudioService) {
+        let watcher = MockDeviceWatcher()
+        let sleepWake = MockSleepWakeObserver()
+        let configHolder = config
+        let policy = ApplyPolicy(config: { configHolder.value },
+                                 now: { [clock] in clock.now })
+
+        self.service = newService
+        self.watcher = watcher
+        self.sleepWake = sleepWake
+        self.policy = policy
+
+        let engine = RuleEngine(
+            service: newService,
+            watcher: watcher,
+            sleepWake: sleepWake,
+            policy: policy,
+            config: { configHolder.value },
+            queue: queue,
+            pollExecutor: nil)
+        engine.onSnapshots = { [weak self] snapshots in
+            self?.snapshots = snapshots
+        }
+        self.engine = engine
     }
 
     /// 在引擎队列上同步执行一段操作
@@ -225,6 +260,25 @@ final class EngineHarness: @unchecked Sendable {
         let rule = DeviceRule(deviceUID: uid,
                               deviceName: "Test Device",
                               transportType: kAudioDeviceTransportTypeHDMI,
+                              preset: preset,
+                              conflictPolicy: conflictPolicy)
+        config.mutate { $0.rules = [rule] }
+        return rule
+    }
+
+    /// ★ 用**已独立配置好的** `service` 建一条规则（多流设备等场景用）。
+    ///
+    /// 与 `setupStandardDevice` 的分工：那个负责"从零配一台设备"，
+    /// 这个只写 `config.rules`，设备/流/能力全部由调用方自己摆好
+    /// （多输出流设备的 `streamsByDevice` 有两个流，无法用单流 helper 表达）。
+    ///
+    /// - Parameter uid: 规则绑定的设备 UID（必须在 `service` 里已配置）
+    @discardableResult
+    func setupRule(uid: String, preset: AudioFormatPreset,
+                   conflictPolicy: ConflictPolicy = .enforceAlways) -> DeviceRule {
+        let rule = DeviceRule(deviceUID: uid,
+                              deviceName: "Test Device",
+                              transportType: kAudioDeviceTransportTypeUSB,
                               preset: preset,
                               conflictPolicy: conflictPolicy)
         config.mutate { $0.rules = [rule] }

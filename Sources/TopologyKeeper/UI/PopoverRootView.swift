@@ -377,7 +377,9 @@ struct LogPanelView: View {
                 VStack(alignment: .leading, spacing: 1) {
                     ForEach(entries.suffix(120)) { entry in
                         HStack(alignment: .top, spacing: 6) {
-                            Text(entry.timestampString)
+                            // ★ 时间字段带方括号：与日志文件里的格式一致，
+                            //   一眼就能把"时间"和后面的内容分开（用户要求保留方括号）。
+                            Text("[\(entry.timestampString)]")
                                 .font(.system(size: 9, design: .monospaced))
                                 .foregroundStyle(.secondary)
                             Text(entry.message)

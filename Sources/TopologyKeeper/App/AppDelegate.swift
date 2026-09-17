@@ -9,7 +9,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusBar: StatusBarController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        Log.info("TopologyKeeper 启动")
+        // ★ 先把日志轮转一次，再走后面的初始化：
+        //     已存在的 TopologyKeeper.log → 改名成 .1（旧的 .1 先删掉）
+        //     然后新建空的 TopologyKeeper.log 供本次运行写入
+        //   ⇒ 上一轮的现场留在 `.1` 里（设置页有独立入口可以打开它）。
+        //
+        //   顺序上的关键点：此处的 `Log.info` **不会**落盘（文件落盘要到
+        //   `appState.start()` 里按配置开启），它只进内存环形缓冲。
+        //   轮转必须发生在任何一行落盘之前 —— 见 `Log.resetLogFileOnLaunch`。
+        //   落盘开启后第一条写到文件里的会是"日志落盘已开启：<路径>"，
+        //   随后紧跟着环境摘要 —— 需要"启动"这个事实时看内存/面板即可。
+        Log.resetLogFileOnLaunch()
+        Log.info("TopologyKeeper 启动（上一轮日志已轮转为 .1，本次写入新文件）")
 
         let environment = AppEnvironment()
         let appState = AppState(environment: environment)

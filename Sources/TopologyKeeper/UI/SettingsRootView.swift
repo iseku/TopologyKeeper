@@ -215,6 +215,17 @@ struct GeneralSettingsTab: View {
                             .buttonStyle(.link).font(.system(size: 10))
                     }
                 }
+                // ★ 上一轮日志的备份入口。
+                //   启动时会轮转一份（见 `Log.resetLogFileOnLaunch`），
+                //   而"上一轮"往往正是出问题的那一轮 —— 不给入口用户根本找不到。
+                if let rotated = state.rotatedLogFilePath {
+                    HStack(spacing: 6) {
+                        Text("上一轮：\(rotated)").font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                        Button("显示") { state.revealRotatedLogFile() }
+                            .buttonStyle(.link).font(.system(size: 10))
+                    }
+                }
                 Toggle("开机自动启动", isOn: Binding(
                     get: { state.launchAtLoginEnabled },     // ★ 读实际状态，不读配置意愿
                     set: { state.setLaunchAtLogin($0) }))
@@ -312,7 +323,8 @@ struct FullLogTab: View {
                 LazyVStack(alignment: .leading, spacing: 1) {
                     ForEach(filtered) { entry in
                         HStack(alignment: .top, spacing: 8) {
-                            Text(entry.timestampString)
+                            // ★ 时间字段带方括号（与日志文件、首页面板统一）
+                            Text("[\(entry.timestampString)]")
                                 .font(.system(size: 10, design: .monospaced))
                                 .foregroundStyle(.secondary)
                             Text(entry.level.rawValue)
@@ -609,11 +621,9 @@ struct ChannelSwapSettingsTab: View {
                     //   ★ 首行改用 `LfeMixPlan.transferFunctionLine` ——
                     //     与首页状态栏的「映射」一行**共用同一份生成逻辑**，
                     //     两处从此不可能再对不上。
-                    let pair = LfeMixPlan.selectableChannels
-                    let other = { (ch: Int) in
-                        ch == pair.lowerBound ? pair.upperBound : pair.lowerBound
-                    }
-                    let cutOut = other(settings.mixTargetChannel)
+                    //   ★ "不连的那条"同样走 `LfeMixPlan` 的纯函数，
+                    //     不在界面层再算一遍配对（那个推导全仓库只允许有一份）。
+                    let cutOut = LfeMixPlan.cutOutputChannel(forTarget: settings.mixTargetChannel)
                     Text("当前传递函数：\n"
                          + "  " + LfeMixPlan.transferFunctionLine(
                                 inputChannel: settings.mixSourceChannel,

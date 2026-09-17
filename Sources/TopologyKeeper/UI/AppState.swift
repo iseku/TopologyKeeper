@@ -29,6 +29,12 @@ final class AppState: ObservableObject {
     /// 日志落盘路径（设置界面展示用）
     var logFilePath: String? { Log.shared.logFilePath }
 
+    /// 上一轮日志备份的路径（`…log.1`）；不存在时为 nil。
+    ///
+    /// 启动时会做一次轮转（见 `Log.resetLogFileOnLaunch`），所以**上一轮的现场**
+    /// 就在这个文件里 —— 设置页给它一个独立的入口，否则用户根本找不到。
+    var rotatedLogFilePath: String? { Log.shared.rotatedLogFilePath }
+
     init(environment: AppEnvironment) {
         self.environment = environment
     }
@@ -131,7 +137,6 @@ final class AppState: ObservableObject {
         Log.shared.configure(capacity: config.logRingCapacity, echoToStderr: false)
         Log.shared.configureFileLogging(enabled: config.recordLogToFile)
     }
-
     func stop() {
         environment.stop()
     }
@@ -207,6 +212,12 @@ final class AppState: ObservableObject {
     /// 在访达里显示日志文件
     func revealLogFile() {
         guard let path = Log.shared.logFilePath else { return }
+        NSWorkspace.shared.selectFile(path, inFileViewerRootedAtPath: "")
+    }
+
+    /// 在访达里显示**上一轮**的日志备份
+    func revealRotatedLogFile() {
+        guard let path = Log.shared.rotatedLogFilePath else { return }
         NSWorkspace.shared.selectFile(path, inFileViewerRootedAtPath: "")
     }
 

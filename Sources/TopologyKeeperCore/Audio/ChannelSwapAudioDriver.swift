@@ -193,11 +193,11 @@ public final class ChannelSwapAudioDriver: ChannelSwapAudioDriving, @unchecked S
             mixGain = mix.gain
             mixSourceIndex = mix.sourceAPIIndex
             mixTargetIndex = mix.targetAPIIndex
-            // ★★ 直通的那条输入 + 不连的那条下游，**都由 CH-O 决定**（用户实测确认）
+            // ★★ 直通的那条输入 + 不连的那条下游 —— **推导走 `LfeMixPlan` 的纯函数**。
             //
             //   规律（4 组用例实测得出）：
-            //     · 直通的输入 = 与 CH-O **不同**的那条输入
-            //     · 不连的下游 = 与 CH-O **不同**的那条下游（本机 CH-O=4 ⇒ CH3-O 不连）
+            //     · 直通的输入  = 与 **CH-I**（上游）配对的那条输入
+            //     · 不连的下游  = 与 **CH-O**（下游）配对的那条输出（本机 CH-O=4 ⇒ CH3-O 不连）
             //     · **衰减仍施加在用户选中的那条 CH-I 上**（这是 CH-I 的唯一作用）
             //
             //   | CH-O | CH-I | CH-O 的结果         | 不连  |
@@ -207,19 +207,18 @@ public final class ChannelSwapAudioDriver: ChannelSwapAudioDriving, @unchecked S
             //   |  3   |  3   | CH4-I + CH3-I×g     | CH4-O |
             //   |  3   |  4   | CH3-I + CH4-I×g     | CH4-O |
             //
-            //   ⚠️ 我曾把"直通的输入"按 **CH-I** 去算（而非 CH-O），
-            //      于是 CH-O=3 的两组全错：用户实测看到"CH3-I 直通 CH3-O、CH4-I 直通 CH4-O"，
-            //      即衰减完全没有生效。
-            let pair = LfeMixPlan.selectableChannels
-            let other = { (ch: Int) in ch == pair.lowerBound ? pair.upperBound : pair.lowerBound }
-            // ★ 直通的输入 = **与 CH-I 不同的那条输入**（两条输入都进 CH-O，
-            //   被选中的那条衰减、另一条直通）。
-            //   ⚠️ 我一度写成 `other(mix.outputChannel)` —— 那是**下游**的配对，
-            //      于是 CH-I=3 时"直通"被算成了 CH3-I 自己，
-            //      CH4-I 根本没进 CH-O（用户实测："CH4-I 直通 CH4-O" 而非混入）。
-            mixDirectIndex = ChannelSwapPlan.apiIndex(forChannel: other(mix.inputChannel))
-            // 不连的下游 = 与 CH-O 不同的那条下游（本机 CH-O=4 ⇒ CH3-O 不连）
-            mixCutIndex = ChannelSwapPlan.apiIndex(forChannel: other(mix.outputChannel))
+            //   ⚠️ 这段"取配对中另一条"的运算此前在本文件、`LfeMixPlan`、
+            //      单测（`LfeMixPlanTests.wiring`）、`tkctl mixVerify` **各抄了一份**，
+            //      而混音语义已经错过 5 次 —— 其中一次正是把上游与下游两个空间
+            //      弄混。更糟的是本文件上面那两句注释曾经**互相矛盾**
+            //      （先说直通由 CH-O 定、下面又说由 CH-I 定），把一次外部审计
+            //      直接引到了错误的结论上（误判成"驱动与展示不一致"的功能缺陷）。
+            //      ⇒ 现在推导只有 `LfeMixPlan.directInputChannel/cutOutputChannel`
+            //        一个出处，四处共用；两个空间的参数名也显式区分。
+            mixDirectIndex = ChannelSwapPlan.apiIndex(
+                forChannel: LfeMixPlan.directInputChannel(forSource: mix.inputChannel))
+            mixCutIndex = ChannelSwapPlan.apiIndex(
+                forChannel: LfeMixPlan.cutOutputChannel(forTarget: mix.outputChannel))
         } else {
             // 计划不可用/越界/自混 → 静默退回"不混音"，
             // 但**必须**在日志里说明，否则就是本项目最怕的"静默失效"
@@ -573,15 +572,7 @@ public final class ChannelSwapAudioDriver: ChannelSwapAudioDriving, @unchecked S
             sFramesIn += Int64(frames)
             // 直接写入环形缓冲（跳过读设备）
             if ring.fillFrames > (ring.capacity * 3) / 4 { return noErr }
-            let (pos, writable) = ring.beginWrite(frames)
-            if writable > 0 {
-                for c in 0..<min(takeChannels, list.count) {
-                    guard let rawSrc = list[c].mData else { continue }
-                    let src = rawSrc.assumingMemoryBound(to: Float.self)
-                    memcpy(ring.plane(c) + pos, src, writable * MemoryLayout<Float>.size)
-                }
-                ring.commitWrite(writable)
-            }
+            writeToRing(frames, from: list)
             return noErr
         }
 
@@ -596,23 +587,59 @@ public final class ChannelSwapAudioDriver: ChannelSwapAudioDriving, @unchecked S
         // 水位过高（源钟快于目标）→ 丢掉整块让消费者追上，避免无限积压
         if ring.fillFrames > (ring.capacity * 3) / 4 { return noErr }
 
-        let (pos, writable) = ring.beginWrite(frames)
-        guard writable > 0 else { return noErr }
-
-        let take = min(takeChannels, list.count)
-        for c in 0..<take {
-            guard let raw = list[c].mData else { continue }
-            memcpy(ring.plane(c) + pos, raw, writable * MemoryLayout<Float>.size)
-            // 抽样统计非零（每 16 帧取 1，实时线程上不做重活）
-            let p = raw.assumingMemoryBound(to: Float.self)
-            var nz = 0
-            var i = 0
-            while i < writable { if abs(p[i]) > 1e-6 { nz += 1 }; i += 16 }
-            sNonZeroInFrames += Int64(nz)
-        }
-        ring.commitWrite(writable)
-        sFramesIn += Int64(writable)
+        writeToRing(frames, from: list)
         return noErr
+    }
+
+    /// 把上游各 plane 的样本写入环形缓冲（**按平面分段**，至多两段）。
+    ///
+    /// ## 为什么必须分段（本文件修过的越界缺陷）
+    ///
+    /// 环形缓冲是"每声道一个 plane、容量各 `capacity` 帧"的布局
+    /// （`plane(c) = store + c*capacity`），而写游标的**平面内偏移**是回绕的
+    /// （`pos = w & mask`）。所以一次回调跨过回绕点时，`[pos, capacity)` 与
+    /// `[0, 余量)` 是**两段互不连续**的内存：
+    ///
+    /// 旧实现直接 `memcpy(plane(c) + pos, src, writable * 4)`，而 `writable`
+    /// 只被"总剩余空间"限制、没有考虑 `pos + writable ≤ capacity`，于是在回绕点：
+    /// * 前几个声道把样本写进了**下一个 plane 的开头**（声道内容互相污染）；
+    /// * 最后一个声道直接**越过 `store` 的 `capacity*channels` 分配区**（堆越界写）。
+    ///
+    /// 触发条件是"回调帧数不整除 `capacity`"（例如 48kHz 下 `capacity=16384`
+    /// 而回调 480 帧）—— 512 等 2 的幂帧数恰好不触发，所以它长期潜伏。
+    ///
+    /// ## 实时线程纪律
+    ///
+    /// 只用指针算术与定长局部元组，**不分配、不加锁、不查表**。
+    @inline(__always)
+    private func writeToRing(_ frames: Int, from list: UnsafeMutableAudioBufferListPointer) {
+        guard let ring else { return }
+        let take = min(takeChannels, list.count)
+        guard take > 0 else { return }
+
+        var start = 0
+        while start < frames {
+            let (pos, writable) = ring.beginWrite(frames, start: start)
+            guard writable > 0 else { break }
+            // 首次写入才做"非零帧"抽样统计，避免第二段把同一批帧重复计入
+            let sampleStats = (start == 0)
+            for c in 0..<take {
+                guard let raw = list[c].mData else { continue }
+                memcpy(ring.plane(c) + pos, raw + start * MemoryLayout<Float>.size,
+                       writable * MemoryLayout<Float>.size)
+                if sampleStats {
+                    // 抽样统计非零（每 16 帧取 1，实时线程上不做重活）
+                    let p = raw.assumingMemoryBound(to: Float.self)
+                    var nz = 0
+                    var i = 0
+                    while i < writable { if abs(p[i]) > 1e-6 { nz += 1 }; i += 16 }
+                    sNonZeroInFrames += Int64(nz)
+                }
+            }
+            ring.commitWrite(writable)
+            sFramesIn += Int64(writable)
+            start += writable
+        }
     }
 
     /// 渲染回调：环形缓冲 → 交错输出缓冲（**交换在本回调内按置换表完成**）
@@ -672,7 +699,7 @@ public final class ChannelSwapAudioDriver: ChannelSwapAudioDriving, @unchecked S
             return noErr
         }
 
-        let (pos, available, read) = ring.beginRead(frames)
+        let (_, available, read) = ring.beginRead(frames, start: 0)
 
         // 水位过低（目标钟快于源）→ 欠载，重新居中避免持续"半空"
         if available < frames / 2 {
@@ -683,17 +710,7 @@ public final class ChannelSwapAudioDriver: ChannelSwapAudioDriving, @unchecked S
         if read > 0 {
             // ★ 交换在这里发生：目标第 c 声道取源第 permute[c] 声道
             //   （permute 已预计算，长度 = takeChannels；恒等即不交换）
-            if mixGain == 0 {
-                // 无混音：按置换表直取（恒等时 permute[c] == c，无需分支）
-                for f in 0..<read {
-                    let base = f * stride
-                    for c in 0..<usable {
-                        let srcCh = (c < permute.count) ? permute[c] : c
-                        dst[base + c] = (ring.plane(srcCh) + pos)[f]
-                    }
-                    if usable < stride { for c in usable..<stride { dst[base + c] = 0 } }
-                }
-            } else {
+            if mixGain != 0 {
                 // ★★ 混音（LFE → 目标声道）：**零分配**的一次乘加。
                 //
                 //    为什么能这么简单：环形缓冲是 **planar**（每声道一个 plane），
@@ -728,23 +745,42 @@ public final class ChannelSwapAudioDriver: ChannelSwapAudioDriving, @unchecked S
                 //      ③ 没切断上游那条的输出 → 未衰减信号从 CH3-O 漏出；
                 //      ④ 把"被衰减的"与"直通的"搞反 → 衰减加在了不该加的那条上。
                 let mixSourcePlane = ring.plane(mixSourceIndex)
-                let mixDirectPlane = ring.plane(mixDirectIndex)
-                for f in 0..<read {
-                    let base = f * stride
-                    for c in 0..<usable {
-                        let srcCh = (c < permute.count) ? permute[c] : c
-                        if c == mixTargetIndex {
-                            // CH-O：被选中那条 × gain  +  另一条 × 1
-                            dst[base + c] = (mixSourcePlane + pos)[f] * mixGain
-                                + (mixDirectPlane + pos)[f]
-                        } else if c == mixCutIndex {
-                            // 配对中不是 CH-O 的那条：不连 ⇒ 静音
-                            dst[base + c] = 0
-                        } else {
-                            dst[base + c] = (ring.plane(srcCh) + pos)[f]
+                // ★ 与 `mixSourceIndex` 配对的那条上游（直通、不衰减）。
+                //   仅当它与衰减那条确实是**不同**的 plane 时才叠加 —— 否则
+                //   `(a×g + a)` 会变成纯电平翻倍（配对相同即是配置错误）。
+                let mixDirectPlane: UnsafeMutablePointer<Float>? =
+                    (mixDirectIndex >= 0 && mixDirectIndex != mixSourceIndex)
+                    ? ring.plane(mixDirectIndex) : nil
+                // ★ 混音分支与无混音分支共用同一套**分段**遍历：
+                //   一次 `beginRead` 可能跨过平面回绕点，此时 `[pos, capacity)` 与
+                //   `[0, 余量)` 是两段互不连续的内存（见 `writeToRing` 的说明）。
+                //   旧实现把 `read` 帧当成一段连续内存去读 `plane(c) + pos`，
+                //   于是回绕点读到的是**下一个 plane 的开头**（声道内容错位）。
+                var segStart = 0
+                while segStart < read {
+                    let seg = ring.beginRead(frames, start: segStart)
+                    guard seg.readable > 0 else { break }
+                    let pos = seg.pos
+                    let count = seg.readable
+                    for f in 0..<count {
+                        let base = (segStart + f) * stride
+                        for c in 0..<usable {
+                            let srcCh = (c < permute.count) ? permute[c] : c
+                            if c == mixTargetIndex {
+                                // CH-O：被选中那条 × gain  +  另一条 × 1
+                                let rate = (mixSourcePlane + pos)[f] * mixGain
+                                let direct = mixDirectPlane.map { ($0 + pos)[f] } ?? 0
+                                dst[base + c] = rate + direct
+                            } else if c == mixCutIndex {
+                                // 配对中不是 CH-O 的那条：不连 ⇒ 静音
+                                dst[base + c] = 0
+                            } else {
+                                dst[base + c] = (ring.plane(srcCh) + pos)[f]
+                            }
                         }
+                        if usable < stride { for c in usable..<stride { dst[base + c] = 0 } }
                     }
-                    if usable < stride { for c in usable..<stride { dst[base + c] = 0 } }
+                    segStart += count
                 }
             }
             // 余量必须清零：绝不能把未初始化内存送进设备（会爆音）
@@ -832,20 +868,43 @@ final class SwapRingBuffer: @unchecked Sendable {
         store + channel * capacity
     }
 
-    @inline(__always) func beginWrite(_ frames: Int) -> (pos: Int, writable: Int) {
+    /// 开始写入，返回**回绕后**的起点与**单段**可写帧数。
+    ///
+    /// - Parameter frames: 本次希望写入的帧数（会被剩余空间再次截断）
+    /// - Parameter start: 本次实际起始的 plane 位置（**必须是提交给本方法的那一段的
+    ///   起点**）。第一段传 0，第二段传上一段的终点。
+    ///
+    /// ⚠️ 返回的 `writable` 同时被两件事截断：总剩余空间，以及**本次调用起点到
+    ///    平面末尾的距离**。调用方必须把"写满这段"与"再调一次写第二段"分开，
+    ///    绝不能拿 `pos + writable` 当作连续内存 —— 那正是本文件修复过的越界缺陷
+    ///    （`plane(c) + pos` 在回绕点越过平面边界，末声道直接写出 `store` 分配区）。
+    @inline(__always) func beginWrite(_ frames: Int, start: Int) -> (pos: Int, writable: Int) {
         let w = writeIndex.pointee
         let space = capacity - Int(w - readIndex.pointee)
-        return (Int(w) & mask, min(frames, space))
+        let want = min(frames, space)
+        guard want > 0 else { return (0, 0) }
+        let pos = (Int(w) & mask) &+ start
+        return (pos, min(want, capacity - pos))
     }
 
     @inline(__always) func commitWrite(_ frames: Int) {
         writeIndex.pointee = writeIndex.pointee &+ Int64(frames)
     }
 
-    @inline(__always) func beginRead(_ frames: Int) -> (pos: Int, available: Int, readable: Int) {
+    /// 开始读取，返回**回绕后**的起点、可读总量与**单段**可读帧数。
+    ///
+    /// - Parameter start: 同 `beginWrite`，第二段传上一段的终点。
+    ///
+    /// ⚠️ `readable` 同样被"到平面末尾的距离"截断；但读侧越过平面边界不会越出
+    ///    `store` 分配区（只会读到下一个 plane 的开头），所以它此前不会崩，
+    ///    只表现为声道内容错位 —— 同样必须分段修掉。
+    @inline(__always) func beginRead(_ frames: Int, start: Int) -> (pos: Int, available: Int, readable: Int) {
         let r = readIndex.pointee
         let available = Int(writeIndex.pointee - r)
-        return (Int(r) & mask, available, min(frames, available))
+        let want = min(frames, available)
+        guard want > 0 else { return (0, available, 0) }
+        let pos = (Int(r) & mask) &+ start
+        return (pos, available, min(want, capacity - pos))
     }
 
     @inline(__always) func commitRead(_ frames: Int) {

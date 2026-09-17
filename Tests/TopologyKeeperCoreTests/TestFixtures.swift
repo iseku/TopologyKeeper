@@ -192,8 +192,23 @@ final class MockCoreAudioService: CoreAudioServiceProtocol, @unchecked Sendable 
         currentFormatByStream[stream]
     }
 
+    /// ★ 与生产实现 `CoreAudioService.currentPhysicalFormat(ofDevice:)` **同口径**。
+    ///
+    /// 多输出流设备必须"全部流一致"才算读到有效格式；否则返回 nil
+    /// （表达"还没到位"）。做成镜像的原因：若这里仍只看第一条流，
+    /// 测试就会比生产更宽松，从而**测不出**"半套格式被判为已锁定"这个缺陷
+    /// （见 `CoreAudioService.formatsAreIdentical` 的说明）。
     func currentPhysicalFormat(ofDevice device: AudioDeviceID) -> AudioStreamBasicDescription? {
-        outputStreams(of: device).first.flatMap { currentFormatByStream[$0] }
+        let streams = outputStreams(of: device)
+        guard let first = streams.first, let reference = currentFormatByStream[first] else {
+            return nil
+        }
+        guard streams.count > 1 else { return reference }
+        for stream in streams.dropFirst() {
+            guard let other = currentFormatByStream[stream],
+                  CoreAudioService.formatsAreIdentical(reference, other) else { return nil }
+        }
+        return reference
     }
 
     func nominalSampleRate(of device: AudioDeviceID) -> Double? {

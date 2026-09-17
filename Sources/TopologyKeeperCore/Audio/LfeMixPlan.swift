@@ -212,6 +212,49 @@ public struct LfeMixPlan: Equatable, Sendable {
         }
     }
 
+    // MARK: - ★ 配对推导的唯一出处（驱动 / 展示 / 测试 / tkctl 共用）
+
+    /// 配对中**与 `channel` 不同的那一条**。
+    ///
+    /// ## 为什么必须收口成纯函数
+    ///
+    /// 这段推导此前被抄了 **4 份**：`ChannelSwapAudioDriver.start`、
+    /// `LfeMixPlan.transferFunctionLine`、`LfeMixPlanTests.wiring`、
+    /// `tkctl mixVerify`。四处必须同步修改，而本项目在混音语义上**已经错过 5 次**
+    /// —— 其中一次就是"直通那条按 CH-O 算 vs 按 CH-I 算"的历史错误。
+    /// 更糟的是四处注释互相矛盾（驱动注释说直通由 CH-I 定、测试注释说由 CH-O 定，
+    /// 而两者代码其实一直一致），一次外部审计就被这类注释误导出了一条误报。
+    ///
+    /// ⇒ 现在只留这一个实现，其余三处全部调用它。
+    ///
+    /// ## 语义（用户实测确认）
+    ///
+    /// * 上游一对：CH3-I / CH4-I，**直通的那条 = 与 CH-I 不同的那条**
+    ///   （被选中的 CH-I 施加衰减，另一条原样相加进 CH-O）
+    /// * 下游一对：CH3-O / CH4-O，**不连的那条 = 与 CH-O 不同的那条**（静音）
+    ///
+    /// 两者用的都是"取配对中的另一条"这同一个运算，只是**输入空间不同**
+    /// （上游索引 vs 下游索引）——这正是必须显式区分参数名的原因。
+    ///
+    /// - Parameter channel: 配对中的一条（1-based 对外声道号）；越界时按配对取另一条
+    @inline(__always)
+    public static func pairedCounterpart(of channel: Int) -> Int {
+        let pair = selectableChannels
+        return channel == pair.lowerBound ? pair.upperBound : pair.lowerBound
+    }
+
+    /// 直通进 CH-O 的**上游**声道（= 与 CH-I 配对的另一条）。
+    @inline(__always)
+    public static func directInputChannel(forSource inputChannel: Int) -> Int {
+        pairedCounterpart(of: inputChannel)
+    }
+
+    /// **不连**（静音）的**下游**声道（= 与 CH-O 配对的另一条）。
+    @inline(__always)
+    public static func cutOutputChannel(forTarget outputChannel: Int) -> Int {
+        pairedCounterpart(of: outputChannel)
+    }
+
     /// 传递函数首行的生成器（纯函数，供配置页 / 状态栏 / 测试共用）。
     ///
     /// 例：`transferFunctionLine(inputChannel: 3, outputChannel: 4, gain: 0.3162)`
@@ -222,8 +265,7 @@ public struct LfeMixPlan: Equatable, Sendable {
     public static func transferFunctionLine(inputChannel: Int,
                                            outputChannel: Int,
                                            gain: Float) -> String {
-        let pair = selectableChannels
-        let direct = inputChannel == pair.lowerBound ? pair.upperBound : pair.lowerBound
+        let direct = directInputChannel(forSource: inputChannel)
         return "CH\(outputChannel)-O = CH\(direct)-I + CH\(inputChannel)-I × "
             + String(format: "%.3f", gain)
     }

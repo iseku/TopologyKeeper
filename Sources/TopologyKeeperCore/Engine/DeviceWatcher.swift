@@ -173,7 +173,16 @@ public final class DeviceWatcher: DeviceWatching, @unchecked Sendable {
     /// 检查所有受监控设备，按需 (re)arm。
     ///
     /// 判定条件：**未注册过**，或 `AudioDeviceID` 变了，或流集合变了。
+    /// 重新注册（或摘除）受监控设备的监听器。
+    ///
+    /// ⚠️ **必须先判 `started`**：本方法会向 CoreAudio 注册监听器并写入 `armed`，
+    ///    而 `stop()` 是 `guard started else { return }`（停过一次就早退）。
+    ///    若 stop 之后还能走到这里，注册进来的监听器就**永远没人清理**
+    ///    （再调 `stop()` 会被守卫挡掉），形成监听器与 `armed` 状态的双重泄漏。
+    ///    调用链实测存在：`RuleEngine.refreshSnapshots` / `configDidChange`
+    ///    都会调本方法，而它们此前没有 `started` 守卫。
     public func rearm() {
+        guard started else { return }
         let wanted = Set(watchedUIDs())
 
         // 不再需要的设备

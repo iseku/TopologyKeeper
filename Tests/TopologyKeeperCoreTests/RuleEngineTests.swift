@@ -978,6 +978,140 @@ struct MultiStreamTests {
         let second = applier.apply(target, to: 700)
         #expect(!second.isSuccess, "只要有一条流没到位，就不能算成功")
     }
+
+    // MARK: T16d..T16g 幂等口径必须与写入口径对齐（回归：半套格式被判为已锁定）
+
+    @Test("T16d 两条流格式不一致时，设备级读取必须返回 nil（不能只看第一条流）")
+    func deviceLevelReadRejectsInconsistentStreams() {
+        let (service, streamA, streamB) = makeTwoStreamDevice(secondStreamSupports8ch: true)
+
+        // 两条流一致 → 有值
+        let consistent = service.currentPhysicalFormat(ofDevice: 700)
+        #expect(consistent != nil, "两条流一致时应读到格式")
+
+        // 第二条流改成**另一个**格式（模拟"只写成功了一条"的半套状态）
+        service.currentFormatByStream[streamB] =
+            makeASBD(channels: 2, bits: 16, rate: 48000, bytesPerChannel: 2)
+        #expect(service.currentPhysicalFormat(ofDevice: 700) == nil,
+                "两条流不一致时必须返回 nil —— 否则幂等检查会短路成「已锁定」")
+
+        // 第一条流读不到 → 也必须是 nil
+        service.currentFormatByStream[streamA] = nil
+        #expect(service.currentPhysicalFormat(ofDevice: 700) == nil)
+        _ = streamA
+    }
+
+    @Test("T16e ★ 半套格式不得被幂等检查判成「已锁定」（此前会永久误报）")
+    func halfAppliedFormatIsNotReportedLocked() {
+        // 目标 8ch/24bit/96k；让两条流**都能**支持该组合，先正常锁定
+        let (service, _, streamB) = makeTwoStreamDevice(secondStreamSupports8ch: true)
+        let harness = EngineHarness()
+        harness.replaceService(service)
+        harness.setupRule(uid: "MULTI-UID", preset: target)
+        harness.start()
+        #expect(harness.firstSnapshot?.state == .locked, "前置条件：应已锁定")
+
+        // 现在把第二条流打回 2ch —— 设备实际处于"半套格式"
+        service.currentFormatByStream[streamB] =
+            makeASBD(channels: 2, bits: 24, rate: 192000, bytesPerChannel: 4)
+        harness.emit(.physicalFormatChanged(uid: "MULTI-UID", streamID: streamB))
+
+        // ★ 旧实现：只看 stream[0]（仍是 8ch/96k）⇒ 直接短路 .locked，永不修复。
+        //   正确行为：识别出"没到位"，进入可重试的等待态。
+        let state = harness.firstSnapshot?.state
+        #expect(state != .locked,
+                "第二条流未达标时不得报「已锁定」（这就是「看起来锁住了」）")
+        if case .waitingForCapability = state {} else {
+            Issue.record("应进入等待就绪（可重试）状态，实际 \(String(describing: state))")
+        }
+    }
+
+    @Test("T16f 两条流都一致且达标时才报「已锁定」（不能矫枉过正）")
+    func consistentStreamsStillLock() {
+        let (service, streamA, streamB) = makeTwoStreamDevice(secondStreamSupports8ch: true)
+        let harness = EngineHarness()
+        harness.replaceService(service)
+        harness.setupRule(uid: "MULTI-UID", preset: target)
+        harness.start()
+
+        // 两条都设成目标格式
+        let applied = makeASBD(channels: 8, bits: 24, rate: 96000, bytesPerChannel: 4)
+        service.currentFormatByStream[streamA] = applied
+        service.currentFormatByStream[streamB] = applied
+        harness.emit(.physicalFormatChanged(uid: "MULTI-UID", streamID: streamA))
+
+        #expect(harness.firstSnapshot?.state == .locked, "两条流一致且达标时必须报已锁定")
+    }
+
+    @Test("T16g 格式读失败不再误报「未连接」（设备在场时不该说设备不在）")
+    func transientReadFailureDoesNotClaimDisconnected() {
+        let (service, streamA, _) = makeTwoStreamDevice(secondStreamSupports8ch: true)
+        service.currentFormatByStream[streamA] = nil      // 第一条流瞬时读不到
+
+        let harness = EngineHarness()
+        harness.replaceService(service)
+        harness.setupRule(uid: "MULTI-UID", preset: target)
+        harness.start()
+
+        let snapshot = harness.firstSnapshot
+        #expect(snapshot?.devicePresent == true, "设备明明在场")
+        #expect(snapshot?.state != .deviceAbsent,
+                "读失败不等于设备消失 —— 旧实现会显示成「未连接」，与 devicePresent=true 自相矛盾")
+    }
+}
+
+// MARK: - T16h 唤醒后兜底轮询的间隔钳制（回归：填 0 会忙循环一分钟）
+
+@Suite("T16h 兜底轮询间隔钳制")
+struct PostWakePollClampTests {
+
+    @Test("T16h 间隔填 0 时被钳到下限（否则 asyncAfter(0) 会灌满队列一分钟）")
+    func zeroIntervalIsClamped() {
+        // 直接钉住常量本身：设置页是无校验的整数输入框，
+        // 用户可以填 0/负数，而 schedulePoll 是**无条件自续**的。
+        #expect(RuleEngine.minimumPostWakePollIntervalMs >= 50,
+                "下限太小就挡不住 asyncAfter(接近 0) 的忙循环")
+        #expect(RuleEngine.minimumPostWakePollIntervalMs <= 1000,
+                "下限太大则唤醒后的兜底轮询形同虚设（能力到位要等 19~28 秒）")
+
+        // 行为验证：记录实际投递的延时，确认 0 被替换成下限。
+        // 用加锁盒子收集（执行器是 @Sendable，不能直接捕获可变数组）。
+        let collected = DelayBox()
+        let engine = RuleEngine(
+            service: MockCoreAudioService(),
+            watcher: MockDeviceWatcher(),
+            sleepWake: MockSleepWakeObserver(),
+            policy: ApplyPolicy(config: { AppConfig() }),
+            config: {
+                var c = AppConfig()
+                c.postWakePollIntervalMs = 0        // ★ 非法值
+                c.postWakePollDurationMs = 60_000
+                return c
+            },
+            queue: DispatchQueue(label: "t16h"),
+            pollExecutor: { ms, work in
+                collected.append(ms)
+                _ = work      // 不执行，避免自续
+            })
+        engine.beginPostWakePollingForTesting()
+
+        let delays = collected.values
+        #expect(delays.count == 1, "应投递一次轮询，实际 \(delays.count) 次")
+        #expect(delays.first == RuleEngine.minimumPostWakePollIntervalMs,
+                "间隔 0 应被钳制为 \(RuleEngine.minimumPostWakePollIntervalMs)，实际 \(String(describing: delays.first))")
+    }
+}
+
+/// 线程安全的延时收集盒（测试用）
+private final class DelayBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [Int] = []
+    func append(_ value: Int) {
+        lock.lock(); storage.append(value); lock.unlock()
+    }
+    var values: [Int] {
+        lock.lock(); defer { lock.unlock() }; return storage
+    }
 }
 
 // MARK: - T17 睡眠通知缺失时的自愈（实测踩到的严重缺陷）
