@@ -22,11 +22,13 @@
 	     后者指**功能阶段**，此处是**对外版本号**，两者不是一回事。
 	     0.1.1：声道处理引擎总开关 + 直通模式（全断/直通/交换/混音四态）。
 	     0.1.2：首页弹窗展开/收起日志时的闪动修复（最外层 frame 的对齐方式；
-	            根因与实测见《交接说明.md》§8 坑 #31）。 -->
+	            根因与实测见《交接说明.md》§8 坑 #31）。
+	     0.1.3：审计 P0/P1/P2 缺陷修复（环形缓冲平面回绕越界、引擎队列纪律、
+	            多流设备"半套格式"误报）+ 日志三项改动（代码改动见 ed3cc8e）。 -->
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.2</string>
+	<string>0.1.3</string>
 	<key>CFBundleVersion</key>
-	<string>3</string>
+	<string>4</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
 	<!-- 菜单栏应用：不出现在 Dock，也不占用 Cmd-Tab -->
