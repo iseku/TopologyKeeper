@@ -442,6 +442,44 @@ struct ChannelSwapSettingsTab: View {
         return Form {
             // ★★ 本页的**电源**（v0.1.1 新增，用户要求）：
             //    它决定"通路跑不跑"，下面的交换/混音只决定"怎么处理"。
+            engineSection(hasBlackHole: hasBlackHole)
+            deviceSection
+            swapSection
+            mixSection
+            behaviorSection
+            statusSection
+        }
+        .formStyle(.grouped)
+        .onAppear { state.refreshSwapDiagnostics() }
+        // ★ 开启总开关时若没有 BlackHole 16ch：明确告诉用户去装驱动，
+        //   而不是让他对着"已开启但一直在等待"的界面自己猜。
+        .alert("未检测到 BlackHole 16ch 音频设备", isPresented: $showBlackHoleMissingAlert) {
+            Button("好", role: .cancel) { }
+        } message: {
+            Text("「声道处理引擎」需要 BlackHole 16ch 作为输入源"
+                 + "（它从虚拟设备的缓冲区读取音频，处理后再输出到播放设备）。\n\n"
+                 + "请先安装 BlackHole 16ch 驱动（免费开源，官网 existential.audio/blackhole），"
+                 + "安装后重新登录或重启，再回来开启本开关。")
+        }
+    }
+
+    // MARK: - 各 Section（★ 为什么拆出来）
+    //
+    // `body` 里的 `Form` 曾经把 6 个 Section 全写在**一个 ViewBuilder 表达式**里：
+    // SwiftUI 的类型检查器要在整个表达式上求解，整页复杂度叠加 ——
+    // 实测 `return Form {` 一处就要 **4400ms** 才通过类型检查（阈值 100ms），
+    // CI 上直接报 `unable to type-check this expression in reasonable time`；
+    // 而本地工具链恰好能过 ⇒ 最难查的那类「本机绿、CI 红」构建失败。
+    // ⇒ 每个 Section 各自成为一个子 View，单个表达式就轻了。
+    // ⚠️ 以后往本页加内容时**继续加进这些子 View**，不要再塞回 `body`。
+    //
+    // 自检手段（改完本页后跑一次，应无任何输出）：
+    //   swift build -Xswiftc -Xfrontend -Xswiftc -warn-long-expression-type-checking=100
+
+    /// Section「声道处理引擎」
+    /// ⚠️ `hasBlackHole` 由 body 传入：检测内部是 `audioQueue.sync` + 设备枚举，
+    ///    刻意只在 body 里算一次（见那里的注释），不能在这里重新计算。
+    private func engineSection(hasBlackHole: Bool) -> some View {
             Section("声道处理引擎") {
                 Toggle("启用声道处理引擎", isOn: Binding(
                     get: { settings.engineEnabled },
@@ -480,6 +518,10 @@ struct ChannelSwapSettingsTab: View {
             // ★ 公共区域：交换与混音**共用同一条音频通路、同一对设备**，
             //   所以设备选择只在这里出现一次，不再放在某个功能区块内
             //   （用户指出：放在"交换"区块里会让人以为只对交换生效）。
+    }
+
+    /// Section「设备选择」
+    private var deviceSection: some View {
             Section("设备选择") {
                 Picker("输入设备（源）", selection: Binding(
                     get: { settings.inputDeviceUID ?? "" },
@@ -512,7 +554,10 @@ struct ChannelSwapSettingsTab: View {
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
+    }
 
+    /// Section「声道交换」
+    private var swapSection: some View {
             Section("声道交换") {
                 Toggle("启用声道交换", isOn: Binding(
                     get: { settings.isEnabled },
@@ -553,6 +598,10 @@ struct ChannelSwapSettingsTab: View {
 
             // 标题不再带固定的"（低音 → 可听声道）"：那是一个写死的语义描述，
             // 而两个声道号都可配置，语义会随配置变化（用户要求标题跟随实际设备/配置）。
+    }
+
+    /// Section「LFE 混音」
+    private var mixSection: some View {
             Section("LFE 混音") {
                 Toggle("启用 LFE 混音", isOn: Binding(
                     get: { settings.mixEnabled },
@@ -624,19 +673,26 @@ struct ChannelSwapSettingsTab: View {
                     //   ★ "不连的那条"同样走 `LfeMixPlan` 的纯函数，
                     //     不在界面层再算一遍配对（那个推导全仓库只允许有一份）。
                     let cutOut = LfeMixPlan.cutOutputChannel(forTarget: settings.mixTargetChannel)
-                    Text("当前传递函数：\n"
-                         + "  " + LfeMixPlan.transferFunctionLine(
-                                inputChannel: settings.mixSourceChannel,
-                                outputChannel: settings.mixTargetChannel,
-                                gain: LfeMixPlan.gain(fromDB: settings.mixGainDB)) + "\n"
-                         + "  CH\(cutOut)-O = 0（不连）\n"
-                         + "  其余输出声道不变")
+                    // ⚠️ 同上：这段长拼接实测 615~738ms 才通过类型检查（阈值 100ms），
+                    //    是 CI「unable to type-check」的下一个候选 ⇒ 先算好再交给 Text。
+                    let transferLine = LfeMixPlan.transferFunctionLine(
+                        inputChannel: settings.mixSourceChannel,
+                        outputChannel: settings.mixTargetChannel,
+                        gain: LfeMixPlan.gain(fromDB: settings.mixGainDB))
+                    let transferText = "当前传递函数：\n"
+                        + "  " + transferLine + "\n"
+                        + "  CH\(cutOut)-O = 0（不连）\n"
+                        + "  其余输出声道不变"
+                    Text(transferText)
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundStyle(.secondary)
 
                 }
             }
+    }
 
+    /// Section「行为」
+    private var behaviorSection: some View {
             Section("行为") {
                 Toggle("按输出设备采样率对齐输入设备", isOn: Binding(
                     get: { settings.alignInputSampleRate },
@@ -658,7 +714,10 @@ struct ChannelSwapSettingsTab: View {
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
+    }
 
+    /// Section「状态」
+    private var statusSection: some View {
             Section("状态") {
                 // ★ 模式由**引擎**给出（`diagnostics.activeFunction`），界面不自己推导 ——
                 //   否则"交换/混音/直通/全断"会出现两套判断，迟早对不上。
@@ -712,11 +771,8 @@ struct ChannelSwapSettingsTab: View {
                         }),
                            in: ChannelSwapSettings.latencyRangeMs,
                            step: 1.0)
-                    Text("这里设的就是**实际平均延迟**：装配完成后水位会被补齐到这个值再开跑，"
-                         + "所以每次切换模式后的延迟都一致。"
-                         + "实际可达下限由**音频缓冲与采样率**共同决定（下限 = 2 × 缓冲 ÷ 采样率），"
-                         + "低于下限的请求会被钳住 —— 上面会显示本机实际值。"
-                         + "实时值见「延迟（水位）」一行。")
+                    // ⚠️ 同 `bufferHintText`：长文案先在属性里拼好，别直接塞进 Text(...)
+                    Text(latencyTargetHintText)
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
 
@@ -747,16 +803,12 @@ struct ChannelSwapSettingsTab: View {
                                 .tag(Int?.some(frames))
                         }
                     }
-                    Text("延迟下限 = 2 × 缓冲 ÷ 采样率 —— 512 帧 ≈ 21ms，**256 帧 ≈ 11ms**。"
-                         + "改小缓冲会让**整机**音频都更敏感（BlackHole 是系统默认输出），"
-                         + "因此 TK 只在通路启动前写入，并在停止/退出时恢复原值；"
-                         + "设备不支持所选值时不会写入，下面会说明原因。"
-                         + "\n实测最省电的低延迟组合：48kHz + 256 帧 + 目标 5~10ms ⇒ 约 10ms、"
-                         + "coreaudiod 占用约 1.7%；192kHz 能压到 5ms 以下，但 CPU 要 3~5%。"
-                         + (state.swapDiagnostics.sampleRate > 0
-                            ? "\n当前采样率 \(Int(state.swapDiagnostics.sampleRate))Hz —— "
-                              + "下限随采样率变化，选项后面标的就是当前值。"
-                            : ""))
+                    // ⚠️ **不要**把这串文案直接拼进 `Text(...)`：ViewBuilder 会把整段
+                    //    表达式交给类型检查器，字符串 + 插值 + 三元一多就指数级变慢 ——
+                    //    实测这段让 CI 报 `unable to type-check this expression in
+                    //    reasonable time`（本地工具链恰好能过，所以只在 CI 暴露）。
+                    //    ⇒ 一律先在局部量里拼好，`Text` 只接收一个字符串。
+                    Text(bufferHintText)
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                     if let bufferInfo = state.swapDiagnostics.bufferDescription {
@@ -772,21 +824,31 @@ struct ChannelSwapSettingsTab: View {
                     state.reapplyChannelSwap()
                 }
             }
+    }
 
+    /// 音频缓冲的说明文案（含"当前采样率"这句可变内容）。
+    ///
+    /// ★ 单独成属性而不是写在 `Text(...)` 里，是为了**让类型检查器轻松**：
+    ///   在 ViewBuilder 里拼长串 + 插值 + 三元，实测会让 CI 报
+    ///   "unable to type-check this expression in reasonable time"
+    ///   （本地工具链能过、CI 的 Xcode 过不了 —— 最坑的一类"环境相关"构建失败）。
+    /// 延迟目标的说明文案。
+    ///
+    /// ★ 两条纪律：
+    /// 1. **一句话就够** —— 设置页是拿来调参的，不是文档；机制与实测数据在
+    ///    README / `docs/水位与延迟.md`，这里只讲"这个滑块是什么、有什么限制"。
+    /// 2. **别在 ViewBuilder 里拼长串** —— 见 `bufferHintText` 的说明
+    ///    （类型检查器会在整个表达式上求解，长了就会让 CI 报超时）。
+    private var latencyTargetHintText: String {
+        "实际平均延迟目标；低于设备下限的请求会被自动钳住。"
+    }
 
-        }
-        .formStyle(.grouped)
-        .onAppear { state.refreshSwapDiagnostics() }
-        // ★ 开启总开关时若没有 BlackHole 16ch：明确告诉用户去装驱动，
-        //   而不是让他对着"已开启但一直在等待"的界面自己猜。
-        .alert("未检测到 BlackHole 16ch 音频设备", isPresented: $showBlackHoleMissingAlert) {
-            Button("好", role: .cancel) { }
-        } message: {
-            Text("「声道处理引擎」需要 BlackHole 16ch 作为输入源"
-                 + "（它从虚拟设备的缓冲区读取音频，处理后再输出到播放设备）。\n\n"
-                 + "请先安装 BlackHole 16ch 驱动（免费开源，官网 existential.audio/blackhole），"
-                 + "安装后重新登录或重启，再回来开启本开关。")
-        }
+    private var bufferHintText: String {
+        var text = "下限 = 2 × 缓冲 ÷ 采样率；改小会影响整机音频（BlackHole 是系统默认输出），"
+            + "TK 仅在通路启动前写入、停止时恢复原值。"
+        let rate = state.swapDiagnostics.sampleRate
+        if rate > 0 { text += "当前采样率 \(Int(rate))Hz。" }
+        return text
     }
 
     private var deviceSummary: String {

@@ -549,9 +549,13 @@ public final class ChannelSwapSupervisor: @unchecked Sendable {
                 }
                 let from = current.map { "\($0)" } ?? "?"
                 parts.append("\(device.name) \(from) → \(want) 帧")
+                // ⚠️ 数值先算好再拼串：把 `Int(Double(...) / max(...) * 1000)` 直接写进
+                //    字符串插值，会让类型检查器在整条表达式上展开（实测 131ms，
+                //    超过 100ms 阈值，是 CI 类型检查超时的候选）。
+                let latencyLimitMs = Int(Double(2 * want)
+                                         / max(device.nominalSampleRate, 1) * 1000)
                 Log.info("声道处理：已把 \(device.name) 的音频缓冲从 \(from) 帧改为 "
-                         + "\(want) 帧（延迟下限随之降到 "
-                         + "\(Int(Double(2 * want) / max(device.nominalSampleRate, 1) * 1000))ms）")
+                         + "\(want) 帧（延迟下限随之降到 \(latencyLimitMs)ms）")
             } else {
                 parts.append("\(device.name) 缓冲写入失败（\(CoreAudioHelpers.describe(status))）")
                 Log.warn("声道处理：写 \(device.name) 音频缓冲失败"

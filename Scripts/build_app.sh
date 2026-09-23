@@ -113,13 +113,40 @@ echo "==> 4/5 打包 dmg"
 # 该形式需要挂载一块可写临时镜像，所以在挂载受限的环境（受限沙箱、部分容器）
 # 会失败，并报出误导性的 "create failed - 目录非空"。遇到就换到不受限的环境构建，
 # 不要为了绕开它改回 makehybrid。
+# ★ 同名卷冲突（2026-09-23 实测踩到，发版时表现为"打包 dmg 失败"）：
+#   若 /Volumes/<App 名> 还挂载着（用户双击装过 dmg、或上次构建异常退出），
+#   `hdiutil create -volname` 会以 **"create failed - 目录非空"** 失败 ——
+#   这个报错完全不指向真正原因（和"受限沙盒"的报错一模一样）。
+#   这里主动卸载并给出可读提示，别让发版卡在一句看不懂的话上。
+if [[ -d "/Volumes/$APP_NAME" ]]; then
+    echo "    检测到同名卷已挂载，先卸载：/Volumes/$APP_NAME"
+    if ! hdiutil detach "/Volumes/$APP_NAME" >/dev/null 2>&1; then
+        echo "    ✗ 卸载失败（可能有程序正在使用它）。请手动执行后重试："
+        echo "        hdiutil detach \"/Volumes/$APP_NAME\""
+        exit 1
+    fi
+fi
+
 DMG="$DIST/$APP_NAME.dmg"
 STAGE="$TK_ROOT/.build/dmg-staging"
 rm -rf "$STAGE" "$DMG"
 mkdir -p "$STAGE"
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
-hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
+if ! hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null; then
+    # 失败原因几乎总是下面三条之一，而 hdiutil 自己只说一句
+    # 「create failed - 目录非空」（两种完全不同的原因报同一句话）。
+    # 直接把排查清单摊开，别让发版卡在一句看不懂的话上。
+    {
+        echo "    ✗ dmg 打包失败。按可能性排序的三个原因："
+        echo "      1) 同名卷仍挂载着：先 hdiutil detach \"/Volumes/$APP_NAME\""
+        echo "         （脚本已自动尝试；被其它程序占用时会失败）"
+        echo "      2) 受限环境（沙盒 / 容器 / 部分 CI 沙箱）不让 hdiutil 挂载临时镜像；"
+        echo "         换到普通终端重跑（GitHub 的 macOS runner 是干净的，不受影响）"
+        echo "      3) 磁盘空间不足：df -h \"$DIST\""
+    } >&2
+    exit 1
+fi
 rm -rf "$STAGE"
 echo "    $DMG"
 
