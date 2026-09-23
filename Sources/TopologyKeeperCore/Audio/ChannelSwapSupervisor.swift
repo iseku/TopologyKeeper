@@ -112,6 +112,18 @@ public final class ChannelSwapSupervisor: @unchecked Sendable {
     /// 规则锁定通知，还是用户手动重试。分开计数后一眼可辨。
     private var _skippedByOrigin: [EvaluationOrigin: Int] = [:]
 
+    // MARK: - 音频缓冲（延迟的绝对下限杠杆）
+
+    /// 被我们改过缓冲的设备及其**原值**（停止时**必须**恢复）。
+    ///
+    /// ⚠️ 为什么必须恢复：`kAudioDevicePropertyBufferFrameSize` 是**全局设备属性**，
+    ///    而 BlackHole 还是系统默认输出 ⇒ 留在小缓冲上会让**整机**音频都更容易欠载。
+    ///    这条纪律与"接管 BlackHole 可调时钟"完全相同。
+    private var _bufferOverrides: [(uid: String, name: String, original: Int)] = []
+
+    /// 缓冲调整的诊断描述（nil = 未调整）
+    private var _bufferDescription: String?
+
     /// 唯一的队列身份标识，用于判断"我是否已经在该队列上"。
     ///
     /// ⚠️ 为什么需要它：这些对外读取接口内部用 `queue.sync` 取一致快照，
@@ -252,6 +264,8 @@ public final class ChannelSwapSupervisor: @unchecked Sendable {
     private func stopAudioLocked() {
         _mixDescription = nil
         audio.stop()
+        // ★ 恢复被我们改过的设备缓冲（全局属性纪律，见 `_bufferOverrides`）
+        restoreBufferFrames()
         _appliedChannelMap = nil
         _sampleRateAligned = nil
         // 绑定作废：下次评估必须重新装配
@@ -409,6 +423,12 @@ public final class ChannelSwapSupervisor: @unchecked Sendable {
         // 系统默认输出是否就是目标设备 —— 决定用 DefaultOutput 还是 HALOutput
         // （依据：DefaultOutput 跟随系统默认输出；实测该路径已听感确认可用）
         let isDefault = (resolver.defaultOutputDevice()?.uid == output.uid)
+        // ★★ 音频缓冲：延迟的**绝对下限杠杆**（下限 = 2 × 缓冲 ÷ 采样率）。
+        //    必须在 `start` 之前做 —— 改缓冲会打断该设备上正在跑的音频流。
+        applyBufferFrames(settings, input: input, output: output)
+
+        // ★ 延迟目标必须在 `start` 之前交给驱动（水位参数在 start 里解析）
+        audio.setTargetLatency(settings.targetLatencyMs)
         do {
             let map = try audio.start(plan: plan,
                                       input: input,
@@ -492,6 +512,74 @@ public final class ChannelSwapSupervisor: @unchecked Sendable {
         }
     }
 
+    /// 依设置把输入/输出设备的 IO 缓冲调到目标值（**只在启动前**调用）。
+    ///
+    /// 三种"不写"的情形都必须留下说明，不能静默略过：
+    /// 用户选了跟随系统 / 设备已是目标值 / 设备不支持目标值。
+    private func applyBufferFrames(_ settings: ChannelSwapSettings,
+                                   input: ChannelSwapDeviceInfo,
+                                   output: ChannelSwapDeviceInfo) {
+        _bufferDescription = nil
+        guard let preferred = settings.preferredBufferFrames else { return }   // 跟随系统
+
+        var parts: [String] = []
+        for device in [input, output] {
+            let current = resolver.bufferFrameSize(of: device)
+            let supported = resolver.bufferFrameSizeRange(of: device)
+            let want = ChannelSwapSettings.resolveBufferFrames(
+                preferred: preferred, current: current, supported: supported)
+
+            guard let want else {
+                if let current, current == preferred {
+                    parts.append("\(device.name) 已是 \(preferred) 帧")
+                } else if let supported, !supported.contains(preferred) {
+                    parts.append("\(device.name) 不支持 \(preferred) 帧"
+                                 + "（支持 \(supported.lowerBound)…\(supported.upperBound)）")
+                } else if current == nil {
+                    parts.append("\(device.name) 读不到缓冲帧数")
+                }
+                continue
+            }
+
+            let status = resolver.setBufferFrameSize(want, on: device)
+            if status == noErr {
+                if let current {
+                    _bufferOverrides.append((uid: device.uid, name: device.name,
+                                             original: current))
+                }
+                let from = current.map { "\($0)" } ?? "?"
+                parts.append("\(device.name) \(from) → \(want) 帧")
+                Log.info("声道处理：已把 \(device.name) 的音频缓冲从 \(from) 帧改为 "
+                         + "\(want) 帧（延迟下限随之降到 "
+                         + "\(Int(Double(2 * want) / max(device.nominalSampleRate, 1) * 1000))ms）")
+            } else {
+                parts.append("\(device.name) 缓冲写入失败（\(CoreAudioHelpers.describe(status))）")
+                Log.warn("声道处理：写 \(device.name) 音频缓冲失败"
+                         + "（\(CoreAudioHelpers.describe(status))）")
+            }
+        }
+        _bufferDescription = parts.isEmpty ? nil : parts.joined(separator: "；")
+    }
+
+    /// 恢复被我们改过缓冲的设备（停止通路 / 退出 App 时）。
+    private func restoreBufferFrames() {
+        for item in _bufferOverrides {
+            guard let device = resolver.device(uid: item.uid, namePrefix: "") else {
+                Log.warn("声道处理：恢复缓冲时找不到设备 \(item.name)（可能已拔出）")
+                continue
+            }
+            let status = resolver.setBufferFrameSize(item.original, on: device)
+            if status == noErr {
+                Log.info("声道处理：已把 \(item.name) 的音频缓冲恢复为 \(item.original) 帧")
+            } else {
+                Log.warn("声道处理：恢复 \(item.name) 音频缓冲失败"
+                         + "（\(CoreAudioHelpers.describe(status))）—— 它仍停留在小缓冲上")
+            }
+        }
+        _bufferOverrides.removeAll()
+        _bufferDescription = nil
+    }
+
     private func setState(_ new: ChannelSwapState) {
         guard new != _state else { return }
         _state = new
@@ -518,6 +606,21 @@ public final class ChannelSwapSupervisor: @unchecked Sendable {
                 framesOut: stats.framesOut,
                 underruns: stats.underruns,
                 renderFailures: stats.renderFailures,
+                // ★ 水位（延迟）随诊断一起上抛：没有它就无法回答
+                //   "现在这一跳到底积压了多少"，BUG1 正是卡在这里。
+                fillFrames: stats.fillFrames,
+                fillMilliseconds: stats.fillMilliseconds,
+                peakFillFrames: stats.peakFillFrames,
+                droppedStaleFrames: stats.droppedStaleFrames,
+                startupAlignedFrames: stats.startupAlignedFrames,
+                resyncCount: stats.resyncCount,
+                targetFillFrames: stats.targetFillFrames,
+                minAchievableLatencyMs: stats.minAchievableLatencyMs,
+                bufferDescription: _bufferDescription,
+                averageFillFrames: stats.averageFillFrames,
+                averageFillMilliseconds: stats.averageFillMilliseconds,
+                sampleRate: stats.sampleRate,
+                starvedFrames: stats.starvedFrames,
                 // ★ 功能感知：把"现在在跑哪个模式"与"混音实际接线"一并交给 UI。
                 //   不这样做的话，UI 只能用交换的措辞显示混音状态
                 //   （已确认的适配缺口：显示"交换中" + "恒等映射"）。

@@ -562,6 +562,9 @@ func cmdSwap(_ args: [String]) {
     case "enable":  swapSetEnabled(true)
     case "disable": swapSetEnabled(false)
     case "engine":  swapEngine(args.count >= 2 ? args[1] : "show")
+    case "latency": swapLatency(Array(args.dropFirst()))
+    case "buffer":  swapBuffer(Array(args.dropFirst()))
+    case "buffer-set": swapBufferSet(Array(args.dropFirst()))
     case "selftest":
         var secs = 8.0
         var pair: (Int, Int)? = nil
@@ -590,6 +593,16 @@ func cmdSwap(_ args: [String]) {
           engine on/off     改写「声道处理引擎」总开关（本页所有功能的电源）
                             · 关闭 = 全断（通路完全不跑，不占用音频设备）
                             · 开启 = 按交换/混音开关装配；两者都关则为「直通」
+
+        延迟相关（v0.1.4 新增；滑块同款，均可在 App 设置页调整）：
+          latency [ms]      查看 / 设置「延迟目标」（5…50ms；装配时水位会补齐到它）
+          buffer [档位]     查看 / 设置「音频缓冲」：auto（跟随系统）或 256 / 512 帧
+                            · 延迟下限 = 2 × 缓冲 ÷ 采样率
+                            · 由 App 在装配前写入、**退出时恢复原值**
+          buffer-set <帧> [in|out|both]
+                            **直接写设备**缓冲：不经过 App、也不会被自动恢复
+                            · 用途一：定位实验（只改输入/输出，配对测 CPU）
+                            · 用途二：App 被强杀后来不及恢复时的应急改回
         """)
     }
 }
@@ -915,6 +928,7 @@ private func mixMonitor(seconds: Double) {
             .map { "CH\($0.offset + 1)-O=\(String(format: "%.4f", $0.element))" }
             .joined(separator: " ")
         print("[\(tick)s] \(peaks)")
+        print("        \(st.latencyText)　\(st.fillMaintenanceText)")
     }
     let final = driver.stats()
     driver.stop()
@@ -993,6 +1007,7 @@ private func mixVerify(seconds: Double) {
             .joined(separator: " ")
         print("[\(tick)] 入回调 \(st.inputCallbackCount) / 出回调 \(st.outputCallbackCount)"
               + " / 帧出 \(st.framesOut) | \(peaks)")
+        print("        \(st.latencyText)　\(st.fillMaintenanceText)")
     }
     driver.stop()
 
@@ -1093,12 +1108,148 @@ private func swapEngine(_ value: String) {
         print("  状态:        \(s.engineEnabled ? "启用" : "停用")")
         print("  当前模式:    \(s.processingMode.shortName)（\(s.processingMode.modeSummary)）")
         print("  交换 / 混音: \(s.isEnabled ? "开" : "关") / \(s.mixEnabled ? "开" : "关")")
+        print("  音频缓冲:    \(s.bufferFramesDescription)"
+              + "（档位 \(ChannelSwapSettings.bufferFrameOptions.map { "\($0) 帧" }.joined(separator: " / "))"
+              + "，`tkctl swap buffer <frames|auto>`）")
+        print("  延迟目标:    \(s.latencyDescription())"
+              + "（范围 \(Int(ChannelSwapSettings.latencyRangeMs.lowerBound))…"
+              + "\(Int(ChannelSwapSettings.latencyRangeMs.upperBound))ms，"
+              + "`tkctl swap latency <ms>` 可改）")
         print("")
         print("提示：模式由总开关与两个功能开关共同决定 ——")
         print("      总开关关 → 全断；开 + 都不开 → 直通（原样转发）；开 + 其一 → 交换 / 混音。")
         print("")
         return
     }
+    notifyAppToReload()
+}
+
+/// `tkctl swap buffer [frames|auto]`：查看 / 设置**音频缓冲帧数**。
+///
+/// 这是延迟的**绝对下限杠杆**：稳态下限 = `2 × 缓冲 ÷ 采样率`
+/// （48kHz 下 512 帧 ⇒ 21ms、256 帧 ⇒ 11ms）。
+///
+/// ⚠️ 它是**全局设备属性**（BlackHole 是系统默认输出 ⇒ 影响所有 App 的音频稳定性）：
+///    TK 只在通路启动前写入、在停止/退出时恢复原值；设备不支持所选值时不会写入，
+///    并在 App 设置页说明原因。
+private func swapBuffer(_ args: [String]) {
+    let store = appConfigStore()
+    let options = ChannelSwapSettings.bufferFrameOptions
+
+    guard let raw = args.first else {
+        let s = store.config.channelSwap
+        print("\n音频缓冲")
+        print("  当前设置: \(s.bufferFramesDescription)")
+        print("  可选档位: auto（跟随系统） / " + options.map { "\($0)" }.joined(separator: " / "))
+        print("")
+        print("提示：稳态延迟下限 = 2 × 缓冲 ÷ 采样率。48kHz 下 512 帧 ≈ 21ms、256 帧 ≈ 11ms。")
+        print("      改小缓冲会影响**整机**（BlackHole 是系统默认输出）；TK 退出时会恢复原值。")
+        return
+    }
+
+    if raw == "auto" || raw == "system" || raw == "0" {
+        store.update { $0.channelSwap.preferredBufferFrames = nil }
+        print("已把音频缓冲设为「跟随系统」（TK 不再写该设备属性）。")
+        notifyAppToReload()
+        return
+    }
+
+    guard let frames = Int(raw), options.contains(frames) else {
+        print("用法: tkctl swap buffer <auto|\(options.map { "\($0)" }.joined(separator: "|"))>")
+        return
+    }
+    store.update { $0.channelSwap.preferredBufferFrames = frames }
+    print("已把音频缓冲设为 \(frames) 帧 —— App 会在下次装配前写入，并在退出时恢复原值。")
+    notifyAppToReload()
+}
+
+/// `tkctl swap buffer-set <frames> [in|out|both]`：**直接写设备**的 IO 缓冲。
+///
+/// 与 `swap buffer` 的区别（别混）：
+/// * `swap buffer` 改的是**设置**，由 App 在下次装配时应用、并在退出时恢复；
+/// * 本命令**立刻写设备**、不经过 App，也不会被自动恢复。
+///
+/// 两个用途：
+/// 1. **应急恢复**：App 被强杀时来不及恢复，缓冲可能停在小值 —— 用它改回来；
+/// 2. **定位实验**：只改输入（BlackHole）或只改输出，分别测 `coreaudiod` 占用，
+///    用以区分"CPU 差异来自 BlackHole 自身特性"还是"来自本通路"
+///    （配对测量方法见 `Scripts/measure_coreaudio_cpu.sh`）。
+private func swapBufferSet(_ args: [String]) {
+    guard let raw = args.first, let frames = Int(raw), frames > 0 else {
+        print("用法: tkctl swap buffer-set <frames> [in|out|both]")
+        print("      frames 例如 256 / 512；第三个参数选择只改输入(in)、")
+        print("      只改输出(out) 或两者(both，默认)")
+        return
+    }
+    let which = args.count >= 2 ? args[1] : "both"
+    guard ["in", "out", "both"].contains(which) else {
+        print("[失败] 第三个参数只能是 in / out / both")
+        return
+    }
+
+    let resolver = swapResolver()
+    var targets: [ChannelSwapDeviceInfo] = []
+    if which == "in" || which == "both",
+       let blackHole = resolver.device(uid: nil, namePrefix: "BlackHole") {
+        targets.append(blackHole)
+    }
+    if which == "out" || which == "both",
+       let output = resolver.preferredOutputDevice(excludingNamePrefix: "BlackHole") {
+        targets.append(output)
+    }
+    guard !targets.isEmpty else {
+        print("[失败] 没找到要设置的设备")
+        return
+    }
+
+    print("\n直接写设备缓冲（不经过 App，也不会被自动恢复）")
+    for device in targets {
+        let before = resolver.bufferFrameSize(of: device)
+        let range = resolver.bufferFrameSizeRange(of: device)
+        let status = resolver.setBufferFrameSize(frames, on: device)
+        let after = resolver.bufferFrameSize(of: device)
+        let beforeText = before.map { "\($0)" } ?? "读不到"
+        let afterText = after.map { "\($0)" } ?? "读不到"
+        let rangeText = range.map { "\($0.lowerBound)…\($0.upperBound)" } ?? "读不到"
+        print("  \(device.name): \(beforeText) → \(afterText) 帧"
+              + "（支持范围 \(rangeText)）"
+              + (status == noErr ? "" : "  [失败] \(CoreAudioHelpers.describe(status))"))
+    }
+    print("\n提示：改完请用 `Scripts/measure_coreaudio_cpu.sh 30` 做配对测量；")
+    print("      若要交回给 App 管理，用 `tkctl swap buffer auto` 或把它设回原值。")
+}
+
+/// `tkctl swap latency [ms]`：查看 / 设置**延迟目标**。
+///
+/// ⚠️ 这是**请求值**：实际可达下限受音频设备 IO 缓冲限制（一个输出回调就要一次性
+///    读走整个缓冲，水位至少要装下 2 个回调）。本机 48kHz / 512 帧回调下实际最低
+///    约 32ms —— 设更小只会被钳到下限。要看**实际**水位请用 `tkctl swap run`，
+///    要看本机实际最低值请到 App「设置 → 声道处理」页（那里有引擎回报的数据）。
+private func swapLatency(_ args: [String]) {
+    let store = appConfigStore()
+    let range = ChannelSwapSettings.latencyRangeMs
+    let lo = Int(range.lowerBound), hi = Int(range.upperBound)
+
+    guard let raw = args.first else {
+        let s = store.config.channelSwap
+        print("\n延迟目标")
+        print("  当前:     \(s.latencyDescription())")
+        print("  可选范围: \(lo)…\(hi)ms")
+        print("")
+        print("提示：稳态延迟 ≈ 目标 + 死区（死区不小于一个输出回调）；实际可达下限")
+        print("      由设备 IO 缓冲决定，App 设置页会显示本机实际最低值。")
+        return
+    }
+    guard let ms = Double(raw) else {
+        print("用法: tkctl swap latency <ms>（\(lo)…\(hi)ms）")
+        return
+    }
+    guard range.contains(ms) else {
+        print("[失败] 延迟目标需在 \(lo)…\(hi)ms 之间（收到 \(ms)）")
+        return
+    }
+    store.update { $0.channelSwap.targetLatencyMs = ms }
+    print("已把延迟目标设为 \(Int(ms))ms —— App 会自动重新装配通路生效。")
     notifyAppToReload()
 }
 
@@ -1173,6 +1324,13 @@ private func swapRun(seconds: Double) {
             print("[\(tick)s] 输入回调 \(st.inputCallbackCount) / 帧 \(st.framesIn)"
                   + " | 输出回调 \(st.outputCallbackCount) / 帧 \(st.framesOut)"
                   + " | 欠载 \(st.underruns) | 渲染失败 \(st.renderFailures)")
+            // ★ 水位＝这一跳引入的延迟。BUG1（"偶尔零点几秒延迟"）此前完全不可见，
+            //   只能靠读代码推理；现在每次试跑都能把水位与它的代价摊开看。
+            print("        \(st.latencyText)　\(st.fillMaintenanceText)")
+            // 诊断工具保留**瞬时**水位（UI 显示的是平均值）：排查时两者都要看 ——
+            // 平均是"代表性延迟"，瞬时差异反映"一个回调内的锯齿幅度"。
+            print("        瞬时水位 \(st.fillFrames) 帧（\(Int(st.fillMilliseconds.rounded()))ms）"
+                  + "　水位峰值 \(st.peakFillFrames) 帧")
             if !st.channelPeaks.isEmpty {
                 let outs = st.channelPeaks.enumerated()
                     .map { "CH\($0.offset + 1)-O=\(String(format: "%.4f", $0.element))" }
@@ -1258,6 +1416,16 @@ private func swapSelfTest(seconds: Double, swapPair: (Int, Int)?) {
             let st = driver.stats()
             print("[\(tick)s] 帧 \(st.framesIn) / \(st.framesOut) | 欠载 \(st.underruns)"
                   + " | 渲染失败 \(st.renderFailures)")
+            // ★★ 逐路峰值**必须**打出来：本命令跑的是生产版驱动的**真实渲染回调**，
+            //    且不依赖 BlackHole 内容、不受麦克风授权影响 —— 它是"交换/直通到底
+            //    有没有把样本写进 ioData"的常驻探针。
+            //    v0.1.3 的静音回归（只有混音出声）当初只能从"帧数在涨、却没有声音"
+            //    间接推断，判读成本极高；有了峰值，全 0 就是一眼可见的铁证。
+            let peaks = st.channelPeaks.enumerated()
+                .map { "CH\($0.offset + 1)-O=\(String(format: "%.3f", $0.element))" }
+                .joined(separator: " ")
+            print("        \(peaks)")
+            print("        \(st.latencyText)　\(st.fillMaintenanceText)")
         }
         driver.stop()
         print("\n已停止。")

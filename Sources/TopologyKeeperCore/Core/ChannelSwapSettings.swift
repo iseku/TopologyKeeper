@@ -96,6 +96,57 @@ public struct ChannelSwapSettings: Codable, Equatable, Hashable, Sendable {
     /// 绝不碰输出设备（避免与格式锁定功能争夺同一字段）。
     public var alignInputSampleRate: Bool
 
+    // MARK: - 延迟目标（用户要求：可调滑块，上下限提前定好）
+
+    /// 可选的**延迟目标**范围（毫秒）。UI 滑块的上下限就是它。
+    ///
+    /// 下限取 5ms 而不是 10ms：**下限必须低于"设备安全水位折算的延迟"**，
+    /// 否则高采样率下的潜力会被滑块挡住 —— 192kHz/512 帧的安全水位只折合 5.3ms，
+    /// 滑块若停在 10ms，用户就永远请求不到那个值（请求 10ms 得到的是 10ms 的水位，
+    /// 而不是设备能给的 5.3ms）。48kHz 下请求 5ms 则会被安全水位自动钳到 21.3ms，
+    /// 不会造成危险。
+    public static let latencyRangeMs: ClosedRange<Double> = 5.0...50.0
+
+    /// 延迟目标默认值（毫秒）。
+    public static let defaultTargetLatencyMs: Double = 30.0
+
+    /// 可选**音频缓冲帧数**档位。UI 的选项就是它（另加"跟随系统" = nil）。
+    ///
+    /// 为什么只给这两档：延迟下限 = `2 × 缓冲 / 采样率`，而缓冲太小时
+    /// **整机**音频都更容易欠载（它不只影响本通路）。
+    public static let bufferFrameOptions: [Int] = [256, 512]
+
+    /// **音频缓冲帧数**：`nil` = 跟随系统（TK 不碰这个属性）。
+    ///
+    /// ## 这是延迟的绝对下限杠杆（用户要求，2026-09-23）
+    ///
+    /// 稳态延迟下限 = `2 × 缓冲帧数 / 采样率`（水位要装下两个输出回调）：
+    /// 48kHz/512 帧 ⇒ 21.3ms；48kHz/**256 帧 ⇒ 10.7ms**。
+    /// 用户明确希望压到 ~11ms，而"换小缓冲"是唯一不动重采样就能做到的手段。
+    ///
+    /// ⚠️ **这是全局设备属性**（BlackHole 还是系统默认输出 ⇒ 影响所有 App 的
+    /// 音频稳定性）⇒ 因此：
+    /// * 只在**通路启动之前**写入（改缓冲会打断该设备上的音频流）；
+    /// * 记住原值，并在**停止通路 / 退出 App 时恢复**（纪律与接管时钟相同）；
+    /// * 设备不支持该值时**不写**，并把原因说出来（不能静默忽略）。
+    public var preferredBufferFrames: Int?
+
+    /// **声道处理通路的延迟目标**（毫秒）—— 稳态水位要维持的延迟量。
+    ///
+    /// 用户要求（2026-09-23）：延迟尽量压低，并给一个滑块让使用者按自己的
+    /// 场景调整，上下限提前定好（`latencyRangeMs`，10…50ms）。
+    ///
+    /// ## ⚠️ 这是**请求值**，不是"一定能跑到的值"
+    ///
+    /// 实际可达下限受**音频设备的 IO 缓冲**限制：一个输出回调就要一次性读走
+    /// 整个缓冲（本机 512 帧 ≈ 10.7ms），所以水位至少要有 2 个回调才安全
+    /// ⇒ 本机实际最低约 **32ms**。
+    ///
+    /// 引擎会把**实际生效的水位参数**与**实际可达到的最低延迟**回报到诊断里，
+    /// UI **必须**把后者显示出来 —— 否则"设了 10ms 却跑 32ms"就又是一次
+    /// "显示的与跑的不是一回事"（本项目最忌讳的那类问题）。
+    public var targetLatencyMs: Double
+
     /// 等待可交换条件的**指数回退**序列（毫秒）。
     /// 依据（用户确认）：1-2-4-8 秒，穷尽后仍不满足则弹告警。
     public var retryBackoffMs: [Int]
@@ -231,6 +282,8 @@ public struct ChannelSwapSettings: Codable, Equatable, Hashable, Sendable {
                 firstChannel: Int = ChannelSwapPlan.defaultFirstChannel,
                 secondChannel: Int = ChannelSwapPlan.defaultSecondChannel,
                 alignInputSampleRate: Bool = true,
+                targetLatencyMs: Double = ChannelSwapSettings.defaultTargetLatencyMs,
+                preferredBufferFrames: Int? = nil,
                 retryBackoffMs: [Int] = [1000, 2000, 4000, 8000],
                 notifyOnGiveUp: Bool = true,
                 mixEnabled: Bool = false,
@@ -245,6 +298,8 @@ public struct ChannelSwapSettings: Codable, Equatable, Hashable, Sendable {
         self.firstChannel = firstChannel
         self.secondChannel = secondChannel
         self.alignInputSampleRate = alignInputSampleRate
+        self.targetLatencyMs = targetLatencyMs
+        self.preferredBufferFrames = preferredBufferFrames
         self.retryBackoffMs = retryBackoffMs
         self.notifyOnGiveUp = notifyOnGiveUp
         self.mixEnabled = mixEnabled
@@ -287,6 +342,14 @@ extension ChannelSwapSettings {
         self.secondChannel = (try? c.decode(Int.self, forKey: .secondChannel)) ?? d.secondChannel
         self.alignInputSampleRate = (try? c.decode(Bool.self, forKey: .alignInputSampleRate))
             ?? d.alignInputSampleRate
+        // ★ 新增键一律 `?? 默认值`：老配置没有它 ⇒ 用默认 30ms（不改变既有行为）
+        self.targetLatencyMs = (try? c.decode(Double.self, forKey: .targetLatencyMs))
+            ?? d.targetLatencyMs
+        // ⚠️ 必须区分"没这个键"与"键存在但为 null"：两者都表示"跟随系统"（nil），
+        //   但语义上后者是用户显式选择的"跟随系统"。decodeIfPresent + ? 合并即可。
+        self.preferredBufferFrames = ((try? c.decodeIfPresent(Int.self,
+                                                              forKey: .preferredBufferFrames)) ?? nil)
+            ?? d.preferredBufferFrames
         self.retryBackoffMs = (try? c.decode([Int].self, forKey: .retryBackoffMs)) ?? d.retryBackoffMs
         self.notifyOnGiveUp = (try? c.decode(Bool.self, forKey: .notifyOnGiveUp)) ?? d.notifyOnGiveUp
         // ★ 新增字段一律 `?? 默认值` —— 否则**升级后整份配置读取失败**，
@@ -349,6 +412,8 @@ extension ChannelSwapSettings {
         try c.encode(firstChannel, forKey: .firstChannel)
         try c.encode(secondChannel, forKey: .secondChannel)
         try c.encode(alignInputSampleRate, forKey: .alignInputSampleRate)
+        try c.encode(targetLatencyMs, forKey: .targetLatencyMs)
+        try c.encodeIfPresent(preferredBufferFrames, forKey: .preferredBufferFrames)
         try c.encode(retryBackoffMs, forKey: .retryBackoffMs)
         try c.encode(notifyOnGiveUp, forKey: .notifyOnGiveUp)
         try c.encode(mixEnabled, forKey: .mixEnabled)
@@ -368,7 +433,8 @@ extension ChannelSwapSettings {
         case engineEnabled
         case isEnabled, inputDeviceUID, outputDeviceUID
         case firstChannel, secondChannel
-        case alignInputSampleRate, retryBackoffMs, notifyOnGiveUp
+        case alignInputSampleRate, targetLatencyMs, preferredBufferFrames
+        case retryBackoffMs, notifyOnGiveUp
         case mixEnabled, mixGainDB
         case mixSourceChannel, mixTargetChannel
         case lastEnabledFeature
@@ -407,6 +473,37 @@ extension ChannelSwapSettings {
         ChannelSwapPlan(sourceChannelCount: ChannelSwapPlan.minimumChannelCount,
                         firstChannel: firstChannel,
                         secondChannel: secondChannel).swapDescription
+    }
+
+    /// 缓冲档位的可读描述，例 `"256 帧（低延迟）"` / `"跟随系统"`。
+    public var bufferFramesDescription: String {
+        guard let frames = preferredBufferFrames else { return "跟随系统" }
+        return "\(frames) 帧（低延迟）"
+    }
+
+    /// 依「用户偏好 + 设备当前值 + 设备支持范围」决定**要写入**的缓冲帧数。
+    ///
+    /// 返回 `nil` 表示**不写**，三种情形都必须说清楚（否则就是静默忽略）：
+    /// * `preferred == nil` → 用户选择跟随系统；
+    /// * `current == preferred` → 已经是目标值，无需打扰设备；
+    /// * 设备支持范围已知且**不含**目标值 → 设备不支持（调用方应把原因告诉用户）。
+    ///
+    /// 纯函数 ⇒ 可单测（真实设备范围千奇百怪，光靠真机试不过来）。
+    public static func resolveBufferFrames(preferred: Int?,
+                                           current: Int?,
+                                           supported: ClosedRange<Int>?) -> Int? {
+        guard let preferred, preferred > 0 else { return nil }
+        if let current, current == preferred { return nil }
+        if let supported, !supported.contains(preferred) { return nil }
+        return preferred
+    }
+
+    /// 延迟目标的可读描述，例 "30ms（实际最低约 32ms）"；`minAchievable` 为 nil 时只显示目标。
+    public func latencyDescription(minAchievableMs: Double? = nil) -> String {
+        let target = Int(targetLatencyMs.rounded())
+        guard let minMs = minAchievableMs, Double(target) < minMs else { return "\(target)ms" }
+        // ★ 请求值低于设备可达下限时必须**明说**，不能让 UI 只显示请求值
+        return "\(target)ms（设备最低 \(Int(minMs.rounded()))ms）"
     }
 
     /// 回退序列的可读描述，例 "1-2-4-8 秒"

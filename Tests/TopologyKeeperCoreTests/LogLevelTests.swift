@@ -124,9 +124,14 @@ struct LogLevelTests {
                 "时间戳 \(stamp) 应以 \(expectedPrefix) 开头（= MM-dd HH:mm:ss.）")
         #expect(stamp.wholeMatch(of: stampPattern) != nil,
                 "时间戳 \(stamp) 不匹配 MM-dd HH:mm:ss.SSS")
-        // ★ 不许出现年份：两位年份或四位年份都不行
+        // ★ 不许出现**四位**年份。
         #expect(!stamp.contains(String(c.year!)), "时间戳不应包含年份 \(c.year!)")
-        #expect(!stamp.contains("\(c.year! % 100)"), "时间戳不应包含两位年份")
+        // ⚠️ 这里曾经还有一条"不许包含**两位**年份"的断言，已删除 ——
+        //    它在整串里搜两位数字，而毫秒是随机三位数、日期本身也是两位数字，
+        //    必然随机误报：实测年份 2026 时毫秒 `.726` 含 "26" 就失败过一次；
+        //    若年份是 2023，日期段 "09-23" 里的 "23" 同样会误报。
+        //    "不含年份"已由上面的**格式精确匹配**（`stampPattern` = MM-dd HH:mm:ss.SSS）
+        //    与四位年份断言共同保证，两位数字无法作为判据。
 
         // LogEntry 实例上的属性与静态方法必须同源（展示层直接用前者）
         let entry = LogEntry(id: 1, date: now, level: .info, message: "x")

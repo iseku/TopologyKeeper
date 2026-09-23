@@ -26,6 +26,35 @@ public protocol ChannelSwapDeviceResolving: Sendable {
     /// `ChannelSwapSettings.alignInputSampleRate` 的说明。
     func setNominalSampleRate(_ rate: Double, on device: ChannelSwapDeviceInfo) -> OSStatus
 
+    // MARK: - IO 缓冲帧数（延迟的**唯一**绝对下限杠杆）
+
+    /// 读设备当前的 **IO 缓冲帧数**（`kAudioDevicePropertyBufferFrameSize`）。
+    ///
+    /// ## 为什么需要它（这是延迟下限的乘数）
+    ///
+    /// 本通路的稳态延迟下限 = `2 × 缓冲帧数 / 采样率` —— 水位至少要装得下
+    /// **两个输出回调**（一个用于本次消费、一个留作调度抖动余量）。
+    /// 于是：
+    ///
+    /// | 采样率 | 缓冲 | 实际最低平均延迟 |
+    /// | --- | --- | --- |
+    /// | 48kHz | 512 帧 | 21.3ms |
+    /// | 48kHz | **256 帧** | **10.7ms** |
+    /// | 192kHz | 512 帧 | 5.3ms |
+    ///
+    /// ⇒ 想把延迟压到 ~11ms，**换小缓冲是唯一不动重采样就能做到的手段**。
+    func bufferFrameSize(of device: ChannelSwapDeviceInfo) -> Int?
+
+    /// 设备支持的缓冲帧数范围（写入前校验 + 给用户提示用）。
+    func bufferFrameSizeRange(of device: ChannelSwapDeviceInfo) -> ClosedRange<Int>?
+
+    /// 写设备的 IO 缓冲帧数。
+    ///
+    /// ⚠️ **只应在通路启动之前调用**：改缓冲会打断该设备上正在跑的音频流。
+    /// ⚠️ 这是**全局设备属性**（BlackHole 还是系统默认输出）⇒ 退出时必须恢复原值，
+    ///    这条纪律与"接管 BlackHole 可调时钟"完全相同。
+    func setBufferFrameSize(_ frames: Int, on device: ChannelSwapDeviceInfo) -> OSStatus
+
     /// 读该设备**自己声明的**声道布局，解析出低音/中置在第几条声道。
     ///
     /// 为什么需要它：本项目原先假定"第 3 声道 = 中置、第 4 声道 = 低音"恒成立，
@@ -40,6 +69,15 @@ public protocol ChannelSwapDeviceResolving: Sendable {
 public extension ChannelSwapDeviceResolving {
     func declaredChannelIndices(of device: ChannelSwapDeviceInfo) -> CoreAudioHelpers.ChannelIndices? {
         nil
+    }
+
+    /// 默认实现：能力探测类接口，Mock / 探针可以不支持（返回 nil = 读不到、
+    /// 写不动）。这与 `devicesDisappeared` 那类"必须表态"的方法不同 ——
+    /// 忽略它的后果是"少了一个可调项"，而不是"静默失效"。
+    func bufferFrameSize(of device: ChannelSwapDeviceInfo) -> Int? { nil }
+    func bufferFrameSizeRange(of device: ChannelSwapDeviceInfo) -> ClosedRange<Int>? { nil }
+    func setBufferFrameSize(_ frames: Int, on device: ChannelSwapDeviceInfo) -> OSStatus {
+        kAudioHardwareUnsupportedOperationError
     }
 }
 
@@ -90,6 +128,18 @@ public protocol ChannelSwapAudioDriving: AnyObject, Sendable {
                outputIsSystemDefault: Bool,
                mix: LfeMixPlan.Resolved?) throws -> [Int32]
 
+    /// 设置**延迟目标**（毫秒）。在 `start` 之前调用。
+    ///
+    /// ⚠️ **刻意不给协议扩展默认实现** —— 这里有过一次血债（真机实测发现）：
+    /// 最初它带了一个空的默认实现，而 `ChannelSwapAudioDriver` **忘了覆盖**，
+    /// 于是"延迟目标滑块"从上线起就没生效过：supervisor 的调用被空实现吞掉，
+    /// 驱动永远用默认 30ms ⇒ 真机表现是「无论怎么拖滑块、怎么换缓冲，
+    /// 目标水位恒为 1440 帧（30ms @48kHz）」。
+    ///
+    /// 这正是本项目注释里反复警告的那类写法：**协议默认实现 = 静默失效**。
+    /// ⇒ 与 `devicesDisappeared` 一样，要求每个实现显式表态（编译器强制）。
+    func setTargetLatency(_ milliseconds: Double)
+
     /// 停止并释放全部音频资源（必须可重复调用）
     func stop()
 
@@ -105,6 +155,52 @@ public extension ChannelSwapAudioDriving {
                outputIsSystemDefault: Bool) throws -> [Int32] {
         try start(plan: plan, input: input, output: output,
                   outputIsSystemDefault: outputIsSystemDefault, mix: nil)
+    }
+}
+
+/// 水位（延迟）文案的**唯一出处**。
+///
+/// 为什么抽成独立函数：`ChannelSwapAudioStats`（驱动层）与
+/// `ChannelSwapDiagnostics`（UI 层）都要展示同一件事，而本项目已多次因
+/// "同一件事两种写法"导致误判（配置页显示传递函数、状态栏显示装配摘要）。
+/// 水位是新概念，一开始就只留一个实现。
+public enum ChannelSwapFillText {
+
+    /// 延迟主行，例 `"延迟 平均 16ms（水位 768 帧，目标 1024）"`。
+    ///
+    /// ⚠️ 传进来的必须是**平均**水位：瞬时水位在一个回调内就跳 512 帧，
+    ///    拿它当"延迟"显示会显得忽大忽小（真机反馈过）。瞬时值留给 `tkctl` 诊断。
+    public static func describe(averageFillFrames: Int, averageMilliseconds: Double,
+                                targetFillFrames: Int) -> String {
+        guard averageFillFrames > 0 || targetFillFrames > 0 else { return "未装配" }
+        return "延迟 平均 \(Int(averageMilliseconds.rounded()))ms"
+            + "（水位 \(averageFillFrames) 帧，目标 \(targetFillFrames)）"
+    }
+
+    /// 水位治理的"代价与事件"一行：峰值水位 + 丢旧帧数 + 欠载重置次数。
+    ///
+    /// 判读口径（写在这里，避免各处自行解读）：
+    /// * `droppedStaleFrames` 平稳且很小 → 低目标水位工作在预期内；
+    /// * 它**持续快速增长** → 两端时钟漂移偏大，靠丢数据换低延迟不划算，
+    ///   该评估 PLL（用 BlackHole 的可调时钟做闭环），而不是继续丢；
+    /// * `resyncCount` 增长 → 源慢于目标，属于事件性跳变，听感上可能有一次轻微顿挫。
+    public static func maintenance(fillFrames: Int, milliseconds: Double,
+                                   peakFillFrames: Int,
+                                   droppedStaleFrames: Int64,
+                                   startupAlignedFrames: Int64,
+                                   starvedFrames: Int64,
+                                   resyncCount: Int64) -> String {
+        let peakMs = fillFrames > 0
+            ? Int((Double(peakFillFrames) * milliseconds / Double(fillFrames)).rounded())
+            : 0
+        // 「启动对齐」与「丢旧」分开显示：前者只在装配后第一拍出现一次
+        // （HDMI 输出设备启动慢造成的积压），后者是运行期的治理代价。
+        // 「静音填充」= 因数据不足被 memset 成 0 的帧数（水位偏浅的真实损伤）。
+        // 它与 `underruns`/`resyncCount` 不同：水位在 [frames/2, frames) 时
+        // 会持续产生静音却完全不计数 —— 所以必须单列，否则"丢音却看不见"。
+        return "水位峰值 \(peakMs)ms　丢旧 \(droppedStaleFrames) 帧"
+            + "　启动对齐 \(startupAlignedFrames) 帧"
+            + "　静音填充 \(starvedFrames) 帧　欠载重置 \(resyncCount) 次"
     }
 }
 
@@ -131,12 +227,87 @@ public struct ChannelSwapAudioStats: Equatable, Sendable {
     ///   · `renderFailures` 涨                    → 根本没读到（TCC 拒绝）
     public var nonZeroInFrames: Int64
 
+    // MARK: - 水位（延迟）
+
+    /// 当前环形缓冲水位（帧）＝ 已积压、尚未播出的音频量。
+    ///
+    /// ★ 这是**延迟的直接度量**：它除以采样率就是本通路额外引入的延迟。
+    /// 为什么必须暴露：BUG1（"偶尔零点几秒延迟"）拖了很久才定位，
+    /// 根因之一就是水位从来不可见 —— 只能靠代码推理，无法用事实反驳。
+    public var fillFrames: Int
+
+    /// 当前水位折算的毫秒（`fillFrames / sampleRate`）。
+    public var fillMilliseconds: Double
+
+    /// 观测到的水位峰值（帧）—— 回答"稳态到底积压了多少"。
+    public var peakFillFrames: Int
+
+    /// 为把水位拉回目标而丢弃的**最旧**帧数。
+    ///
+    /// ★ 这是低目标水位的**代价**：靠丢最旧数据换低延迟。它应当很小且平稳；
+    /// 若持续快速增长，说明时钟漂移较大，该考虑用 PLL（见文档）而不是继续丢。
+    public var droppedStaleFrames: Int64
+
+    /// ★ 首次输出回调把水位对齐到目标时丢掉的**启动积压**（帧）。
+    ///
+    /// 与 `droppedStaleFrames` 分开：它只在装配后的**第一拍**出现一次
+    /// （输入单元先启动、HDMI 输出设备后启动造成的积压），而后者是运行期的治理代价。
+    /// 混在一起会让用户把"一次性对齐"误读成"一直在丢"。
+    public var startupAlignedFrames: Int64
+
+    /// ★ 运行**平均**水位（帧）。
+    ///
+    /// 为什么单列：瞬时水位在一个回调内就跳 512 帧（刚消费完 0、刚写完 512），
+    /// 直接当"延迟"展示会显得忽大忽小。**平均水位才是代表性延迟**。
+    public var averageFillFrames: Int
+
+    /// 平均水位折算的毫秒
+    public var averageFillMilliseconds: Double
+
+    /// 当前通路的采样率（Hz）。
+    ///
+    /// 诊断需要它是因为**延迟下限同时取决于缓冲帧数与采样率**：
+    /// `下限 = 2 × 缓冲 ÷ 采样率`（同一档"256 帧"在 48kHz 是 10.7ms、
+    /// 在 192kHz 只有 2.7ms）。UI 用它把每个档位的真实下限算给用户看。
+    public var sampleRate: Double
+
+    /// ★ 因**数据不足**被静音填充的帧数 —— "丢音却看不见"的那部分。
+    ///
+    /// 水位落在 `[frames/2, frames)` 时每次回调都会静音一小段，但既不计数
+    /// `underruns` 也不 `resync`。它持续增长 ⇒ 水位长期偏浅，该抬高目标水位。
+    public var starvedFrames: Int64
+
+    /// 欠载"重新居中"次数（每次都是一次事件性的数据跳变）。
+    public var resyncCount: Int64
+
+    /// 目标水位（帧）—— 稳态期望值，诊断时用来判断"现在偏高还是偏低"。
+    public var targetFillFrames: Int
+
+    /// 本设备**实际可达到的最低**稳态延迟（毫秒）。
+    ///
+    /// ★ 存在的唯一理由：用户请求的延迟目标可能低于物理下限（受音频设备的
+    ///   IO 缓冲限制）—— UI 必须显示这个值，否则"设了 10ms 却跑 32ms"
+    ///   就成了一次"显示的与跑的不是一回事"。
+    public var minAchievableLatencyMs: Double
+
 
     public init(inputCallbackCount: Int = 0, outputCallbackCount: Int = 0,
                 framesIn: Int64 = 0, framesOut: Int64 = 0,
                 underruns: Int64 = 0, renderFailures: Int64 = 0,
                 channelPeaks: [Float] = [],
-                nonZeroInFrames: Int64 = 0) {
+                nonZeroInFrames: Int64 = 0,
+                fillFrames: Int = 0,
+                fillMilliseconds: Double = 0,
+                peakFillFrames: Int = 0,
+                droppedStaleFrames: Int64 = 0,
+                startupAlignedFrames: Int64 = 0,
+                resyncCount: Int64 = 0,
+                targetFillFrames: Int = 0,
+                minAchievableLatencyMs: Double = 0,
+                averageFillFrames: Int = 0,
+                averageFillMilliseconds: Double = 0,
+                sampleRate: Double = 0,
+                starvedFrames: Int64 = 0) {
         self.inputCallbackCount = inputCallbackCount
         self.outputCallbackCount = outputCallbackCount
         self.framesIn = framesIn
@@ -145,5 +316,35 @@ public struct ChannelSwapAudioStats: Equatable, Sendable {
         self.renderFailures = renderFailures
         self.channelPeaks = channelPeaks
         self.nonZeroInFrames = nonZeroInFrames
+        self.fillFrames = fillFrames
+        self.fillMilliseconds = fillMilliseconds
+        self.peakFillFrames = peakFillFrames
+        self.droppedStaleFrames = droppedStaleFrames
+        self.startupAlignedFrames = startupAlignedFrames
+        self.resyncCount = resyncCount
+        self.targetFillFrames = targetFillFrames
+        self.minAchievableLatencyMs = minAchievableLatencyMs
+        self.averageFillFrames = averageFillFrames
+        self.averageFillMilliseconds = averageFillMilliseconds
+        self.sampleRate = sampleRate
+        self.starvedFrames = starvedFrames
+    }
+
+    /// 延迟主行（文案与 UI 共用同一出处）—— 用**平均**水位，避免显示锯齿
+    public var latencyText: String {
+        ChannelSwapFillText.describe(averageFillFrames: averageFillFrames,
+                                     averageMilliseconds: averageFillMilliseconds,
+                                     targetFillFrames: targetFillFrames)
+    }
+
+    /// 水位治理行（丢旧帧数 / 欠载重置 / 峰值水位）
+    public var fillMaintenanceText: String {
+        ChannelSwapFillText.maintenance(fillFrames: fillFrames,
+                                        milliseconds: fillMilliseconds,
+                                        peakFillFrames: peakFillFrames,
+                                        droppedStaleFrames: droppedStaleFrames,
+                                        startupAlignedFrames: startupAlignedFrames,
+                                        starvedFrames: starvedFrames,
+                                        resyncCount: resyncCount)
     }
 }

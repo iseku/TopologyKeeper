@@ -47,6 +47,29 @@ public final class CoreAudioChannelSwapResolver: ChannelSwapDeviceResolving, @un
             CoreAudioHelpers.address(kAudioDevicePropertyNominalSampleRate), rate)
     }
 
+    public func bufferFrameSize(of device: ChannelSwapDeviceInfo) -> Int? {
+        CoreAudioHelpers.getScalar(device.id,
+            CoreAudioHelpers.address(kAudioDevicePropertyBufferFrameSize),
+            as: UInt32.self).map(Int.init)
+    }
+
+    public func bufferFrameSizeRange(of device: ChannelSwapDeviceInfo) -> ClosedRange<Int>? {
+        guard let range = CoreAudioHelpers.getScalar(device.id,
+            CoreAudioHelpers.address(kAudioDevicePropertyBufferFrameSizeRange),
+            as: AudioValueRange.self) else { return nil }
+        let low = Int(range.mMinimum.rounded())
+        let high = Int(range.mMaximum.rounded())
+        guard low > 0, high >= low else { return nil }
+        return low...high
+    }
+
+    public func setBufferFrameSize(_ frames: Int, on device: ChannelSwapDeviceInfo) -> OSStatus {
+        guard frames > 0 else { return kAudioHardwareIllegalOperationError }
+        return CoreAudioHelpers.setScalar(device.id,
+            CoreAudioHelpers.address(kAudioDevicePropertyBufferFrameSize),
+            UInt32(frames))
+    }
+
     /// 读设备声明的声道布局（低音/中置各在第几条声道）。
     ///
     /// 实测：本机 `27C3A Pro` 声明 **L R LFE C Ls Rs …**，

@@ -495,8 +495,18 @@ struct ChannelSwapRowView: View {
                         Text("\(input) → \(output)")
                     }
                     Text("映射：\(diag.mappingDescription)")
-                    Text("帧 \(diag.framesIn) / \(diag.framesOut)　欠载 \(diag.underruns)")
+                    // ★ 延迟（水位）必须常驻可见：BUG1 是"偶尔零点几秒延迟"，
+                    //   用户只在听感上察觉、无从自查。把水位折算的延迟摆在首页，
+                    //   才能自己判断"现在是不是又积压上去了"。
+                    Text(diag.latencyText)
                         .foregroundStyle(.secondary)
+                    // 水位治理的代价与事件（丢旧 / 启动对齐 / 欠载重置）
+                    Text(diag.fillMaintenanceText)
+                        .foregroundStyle(.secondary)
+                    // ⚠️ 刻意**不显示**累计帧数（framesIn/framesOut）：
+                    //   用户反馈"这个数字没什么用"，而它真正有用的场合是排查
+                    //   "回调在跑、帧数在涨、却没有声音"（`tkctl` 诊断里保留）。
+                    //   首页空间有限，让位给延迟/水位这类可直接判读的量。
                 }
                 .font(.system(size: 10))
                 .foregroundStyle(.secondary)

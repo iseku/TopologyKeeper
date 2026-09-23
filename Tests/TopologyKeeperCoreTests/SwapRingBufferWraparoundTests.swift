@@ -49,7 +49,7 @@ struct SwapRingBufferWraparoundTests {
             // 生产者：按驱动 writeToRing 的分段语义写满 frames 帧
             var start = 0
             while start < frames {
-                let (pos, writable) = ring.beginWrite(frames, start: start)
+                let (pos, writable) = ring.beginWrite(frames - start)
                 guard writable > 0 else { break }
                 #expect(pos + writable <= cap,
                         "第 \(start) 帧起的段越过平面边界：pos=\(pos) + writable=\(writable) > \(cap)")
@@ -59,16 +59,18 @@ struct SwapRingBufferWraparoundTests {
             }
 
             // 消费者：按驱动 handleOutput 的分段语义消费
-            let avail = ring.beginRead(frames, start: 0).available
+            // ★ 分段消费：每段读完即 commitRead（游标随之推进到下一段起点），
+            //   与写侧对称 —— 这也是驱动 `copyRingToInterleaved` 的写法。
+            let avail = ring.beginRead(frames).available
             var consumed = 0
             while consumed < frames {
-                let (pos, _, readable) = ring.beginRead(frames, start: consumed)
+                let (pos, _, readable) = ring.beginRead(frames - consumed)
                 guard readable > 0 else { break }
                 #expect(pos + readable <= cap,
                         "读段越过平面边界：pos=\(pos) + readable=\(readable) > \(cap)")
+                ring.commitRead(readable)
                 consumed += readable
             }
-            ring.commitRead(consumed)
             if avail < frames / 2 { ring.resync(frames) }
         }
 
@@ -106,7 +108,7 @@ struct SwapRingBufferWraparoundTests {
             if ring.fillFrames <= (ring.capacity * 3) / 4 {
                 var start = 0
                 while start < frames {
-                    let (pos, writable) = ring.beginWrite(frames, start: start)
+                    let (pos, writable) = ring.beginWrite(frames - start)
                     guard writable > 0 else { break }
                     if start > 0 { sawWrap = true }
                     for c in 0..<channels {
@@ -125,7 +127,7 @@ struct SwapRingBufferWraparoundTests {
             let want = frames / 2
             var consumed = 0
             while consumed < want {
-                let (pos, _, readable) = ring.beginRead(want, start: consumed)
+                let (pos, _, readable) = ring.beginRead(want - consumed)
                 guard readable > 0 else { break }
                 for c in 0..<channels {
                     for f in 0..<readable {
@@ -135,9 +137,9 @@ struct SwapRingBufferWraparoundTests {
                         checked += 1
                     }
                 }
+                ring.commitRead(readable)
                 consumed += readable
             }
-            ring.commitRead(consumed)
         }
 
         #expect(sawWrap, "本用例必须真的跨过回绕点")
@@ -182,7 +184,7 @@ struct SwapRingBufferWraparoundTests {
         func write(_ n: Int) -> Int {
             var start = 0
             while start < n {
-                let (pos, writable) = ring.beginWrite(n, start: start)
+                let (pos, writable) = ring.beginWrite(n - start)
                 guard writable > 0 else { break }
                 if start > 0 { sawWrapWrite = true }
                 #expect(pos + writable <= cap,
@@ -205,7 +207,7 @@ struct SwapRingBufferWraparoundTests {
             var done = 0
             while done < n {
                 let want = n - done
-                let (pos, _, readable) = ring.beginRead(want, start: 0)
+                let (pos, _, readable) = ring.beginRead(want)
                 guard readable > 0 else { break }
                 if readable < want { sawWrapRead = true }
                 for c in 0..<channels {
@@ -221,9 +223,9 @@ struct SwapRingBufferWraparoundTests {
                     }
                 }
                 readRounds += 1
+                ring.commitRead(readable)
                 done += readable
             }
-            ring.commitRead(done)
         }
 
         // ── 第 1 步：填到 3/4 ──
@@ -233,8 +235,8 @@ struct SwapRingBufferWraparoundTests {
             written += write(want)
         }
         #expect(ring.fillFrames == fillTarget, "应恰好填到 \(fillTarget)，实际 \(ring.fillFrames)")
-        #expect(ring.beginWrite(1, start: 0).pos == fillTarget,
-                "写游标的平面内偏移应为 \(fillTarget)，实际 \(ring.beginWrite(1, start: 0).pos)")
+        #expect(ring.beginWrite(1).pos == fillTarget,
+                "写游标的平面内偏移应为 \(fillTarget)，实际 \(ring.beginWrite(1).pos)")
 
         // ── 第 2 步：反复"腾空间 → 写 480 帧"，每次写都跨回绕点 ──
         for _ in 0..<12 {

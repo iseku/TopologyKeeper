@@ -52,6 +52,35 @@ final class MockSwapResolver: ChannelSwapDeviceResolving, @unchecked Sendable {
         return sampleRateSetStatus
     }
 
+    // MARK: 音频缓冲（延迟的绝对下限杠杆）
+
+    /// 记录缓冲写入（断言"音频缓冲设置有没有真的落到设备上"）
+    private(set) var setBufferFrameSizeCalls: [(frames: Int, deviceUID: String)] = []
+    /// 各设备当前缓冲帧数（**按 UID 分开** —— 真实设备是各自独立的属性；
+    /// 早期这里是一个共享标量，于是"写完第一台，第二台就被判成已是目标值"，
+    /// 接线测试（Y2）当场抓到了这个建模错误）。
+    var bufferFramesByUID: [String: Int] = [:]
+    /// 未单独设置过的设备读到的默认值（nil = 读不到）
+    var currentBufferFrames: Int? = 512
+    /// 模拟设备支持的缓冲范围（nil = 读不到）
+    var supportedBufferFrames: ClosedRange<Int>? = 32...4096
+    /// 设为非 noErr 则写缓冲失败
+    var bufferFrameSizeSetStatus: OSStatus = noErr
+
+    func bufferFrameSize(of device: ChannelSwapDeviceInfo) -> Int? {
+        bufferFramesByUID[device.uid] ?? currentBufferFrames
+    }
+
+    func bufferFrameSizeRange(of device: ChannelSwapDeviceInfo) -> ClosedRange<Int>? {
+        supportedBufferFrames
+    }
+
+    func setBufferFrameSize(_ frames: Int, on device: ChannelSwapDeviceInfo) -> OSStatus {
+        setBufferFrameSizeCalls.append((frames, device.uid))
+        if bufferFrameSizeSetStatus == noErr { bufferFramesByUID[device.uid] = frames }
+        return bufferFrameSizeSetStatus
+    }
+
     /// 设备**自己声明的**声道布局。nil = 模拟"读不到"（走约定回落）。
     ///
     /// 本机实测值：低音=第 3 声道、中置=第 4 声道（L R LFE C …）——
@@ -128,6 +157,17 @@ final class MockSwapAudio: ChannelSwapAudioDriving, @unchecked Sendable {
         startCalls.append((plan, input.uid, output.uid, outputIsSystemDefault, map))
         startMixCalls.append(mix)
         return map
+    }
+
+    /// ★ 记录每次设置的**延迟目标**（断言"滑块有没有真的传到驱动"）。
+    ///
+    /// 这个数组是拿真机静音/无效换来的：早期 `setTargetLatency` 只有协议扩展的
+    /// 空实现、真实驱动忘了覆盖，滑块从上线起就没生效过，而**当时没有任何测试
+    /// 覆盖这条链路**。现在协议不再给默认实现，且这里逐次留痕。
+    private(set) var targetLatencyCalls: [Double] = []
+
+    func setTargetLatency(_ milliseconds: Double) {
+        targetLatencyCalls.append(milliseconds)
     }
 
     func stop() { stopCount += 1 }

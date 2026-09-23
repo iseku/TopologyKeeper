@@ -681,11 +681,88 @@ struct ChannelSwapSettingsTab: View {
                     LabeledContent("实际映射") {
                         Text(state.swapDiagnostics.mappingDescription)
                     }
+                    // ⚠️ 刻意不显示累计帧数（见首页同处说明）：保留有判读价值的
+                    //   欠载与渲染失败计数即可；帧数在 `tkctl` 诊断里仍可读。
                     LabeledContent("实时统计") {
-                        Text("帧 \(state.swapDiagnostics.framesIn) / "
-                             + "\(state.swapDiagnostics.framesOut)　"
-                             + "欠载 \(state.swapDiagnostics.underruns)　"
+                        Text("欠载 \(state.swapDiagnostics.underruns)　"
                              + "渲染失败 \(state.swapDiagnostics.renderFailures)")
+                    }
+                    // ★ 水位（延迟）与它的代价：低目标水位靠"丢最旧数据"换低延迟，
+                    //   这个代价必须让用户看得见，否则又是一次"数值上在跑、听感上莫名"。
+                    LabeledContent("延迟（水位）") {
+                        Text(state.swapDiagnostics.latencyText + "　"
+                             + state.swapDiagnostics.fillMaintenanceText)
+                    }
+                    // ★ 延迟目标（用户要求：给滑块自己调，上下限提前定好 10…50ms）。
+                    //
+                    //   ⚠️ 显示的是**请求值**，而实际可达下限受音频设备 IO 缓冲限制
+                    //     （一个输出回调就要读走整个缓冲 ⇒ 水位至少要装下 2 个回调）。
+                    //     所以这里同时显示引擎回报的"本机实际最低值" ——
+                    //     否则用户设 10ms、实际跑 32ms，就又是一次
+                    //     "显示的与跑的不是一回事"（本项目最忌讳的那类问题）。
+                    LabeledContent("延迟目标") {
+                        Text(settings.latencyDescription(
+                            minAchievableMs: state.swapDiagnostics.minAchievableLatencyMs))
+                            .monospacedDigit()
+                    }
+                    Slider(value: Binding(
+                        get: { settings.targetLatencyMs },
+                        set: { newValue in
+                            state.updateConfig { $0.channelSwap.targetLatencyMs = newValue }
+                        }),
+                           in: ChannelSwapSettings.latencyRangeMs,
+                           step: 1.0)
+                    Text("这里设的就是**实际平均延迟**：装配完成后水位会被补齐到这个值再开跑，"
+                         + "所以每次切换模式后的延迟都一致。"
+                         + "实际可达下限由**音频缓冲与采样率**共同决定（下限 = 2 × 缓冲 ÷ 采样率），"
+                         + "低于下限的请求会被钳住 —— 上面会显示本机实际值。"
+                         + "实时值见「延迟（水位）」一行。")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+
+                    // ★ 音频缓冲：延迟的**绝对下限杠杆**（用户要求，2026-09-23）
+                    //
+                    //   下限 = 2 × 缓冲 ÷ 采样率（水位要装下两个输出回调）：
+                    //   48kHz/512 帧 ≈ 21ms、256 帧 ≈ 11ms —— 这是唯一不动重采样
+                    //   就能把延迟压到 11ms 的手段。
+                    //
+                    //   ⚠️ 它是**全局设备属性**（BlackHole 还是系统默认输出，
+                    //     影响所有 App 的音频稳定性），所以 TK 只在通路启动前写入、
+                    //     停止/退出时恢复原值，并把"没生效的原因"一并显示出来。
+                    LabeledContent("音频缓冲") {
+                        Text(settings.bufferFramesDescription).monospacedDigit()
+                    }
+                    Picker("音频缓冲", selection: Binding(
+                        get: { settings.preferredBufferFrames },
+                        set: { newValue in
+                            state.updateConfig { $0.channelSwap.preferredBufferFrames = newValue }
+                        })) {
+                        Text("跟随系统").tag(Int?.none)
+                        ForEach(ChannelSwapSettings.bufferFrameOptions, id: \.self) { frames in
+                            // ★ 档位必须带上"它在**当前采样率**下的真实下限"：
+                            //   同一档"256 帧"在 48kHz 是 10.7ms、在 192kHz 只有 2.7ms
+                            //   （下限 = 2 × 缓冲 ÷ 采样率）。不带这个数字，用户没法判断
+                            //   该选哪档、也不知道自己已经调到什么程度。
+                            Text("\(frames) 帧" + bufferLatencyHint(frames))
+                                .tag(Int?.some(frames))
+                        }
+                    }
+                    Text("延迟下限 = 2 × 缓冲 ÷ 采样率 —— 512 帧 ≈ 21ms，**256 帧 ≈ 11ms**。"
+                         + "改小缓冲会让**整机**音频都更敏感（BlackHole 是系统默认输出），"
+                         + "因此 TK 只在通路启动前写入，并在停止/退出时恢复原值；"
+                         + "设备不支持所选值时不会写入，下面会说明原因。"
+                         + "\n实测最省电的低延迟组合：48kHz + 256 帧 + 目标 5~10ms ⇒ 约 10ms、"
+                         + "coreaudiod 占用约 1.7%；192kHz 能压到 5ms 以下，但 CPU 要 3~5%。"
+                         + (state.swapDiagnostics.sampleRate > 0
+                            ? "\n当前采样率 \(Int(state.swapDiagnostics.sampleRate))Hz —— "
+                              + "下限随采样率变化，选项后面标的就是当前值。"
+                            : ""))
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                    if let bufferInfo = state.swapDiagnostics.bufferDescription {
+                        Text(bufferInfo)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
                     }
                     if let aligned = state.swapDiagnostics.sampleRateAligned {
                         LabeledContent("采样率对齐") { Text(aligned) }
@@ -719,6 +796,16 @@ struct ChannelSwapSettingsTab: View {
         }
         return "\(input)（\(diag.inputChannelCount) 进） → "
             + "\(output)（\(diag.outputChannelCount) 声道）"
+    }
+
+    /// 缓冲档位在当前采样率下的真实延迟下限（`2 × 缓冲 ÷ 采样率`）。
+    ///
+    /// 采样率未知（未装配）时返回空串 —— 宁可不说，也不给一个可能错的数字。
+    private func bufferLatencyHint(_ frames: Int) -> String {
+        let rate = state.swapDiagnostics.sampleRate
+        guard rate > 0 else { return "" }
+        let ms = Double(2 * frames) / rate * 1000
+        return String(format: "（下限 %.1fms）", ms)
     }
 
     /// "第 3 声道（中置）"

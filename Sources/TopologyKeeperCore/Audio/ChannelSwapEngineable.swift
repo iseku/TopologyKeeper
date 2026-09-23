@@ -226,6 +226,40 @@ public struct ChannelSwapDiagnostics: Equatable, Sendable {
     public var underruns: Int64
     public var renderFailures: Int64
 
+    // MARK: - 水位（延迟）—— v0.1.4 起可观测
+
+    /// 环形缓冲当前水位（帧）= 已积压未播出的音频量 ⇒ **延迟的直接度量**
+    public var fillFrames: Int
+    /// 水位折算毫秒
+    public var fillMilliseconds: Double
+    /// 水位峰值（帧）
+    public var peakFillFrames: Int
+    /// 低水位收敛丢弃的最旧帧数（低延迟的代价）
+    public var droppedStaleFrames: Int64
+    /// 首次输出回调把水位对齐到目标时丢掉的启动积压（帧）
+    public var startupAlignedFrames: Int64
+    /// 运行**平均**水位（帧）—— 代表性延迟（瞬时值在一个回调内就跳 512 帧）
+    public var averageFillFrames: Int
+    /// 平均水位折算毫秒
+    public var averageFillMilliseconds: Double
+    /// 当前采样率（Hz）—— 与缓冲帧数共同决定延迟下限：`2 × 缓冲 ÷ 采样率`
+    public var sampleRate: Double
+    /// 因数据不足被静音填充的帧数（丢音却看不见的那部分）
+    public var starvedFrames: Int64
+    /// 欠载重新居中次数
+    public var resyncCount: Int64
+    /// 目标水位（帧）
+    public var targetFillFrames: Int
+    /// 本设备实际可达到的最低稳态延迟（毫秒）—— UI 显示"设不到那么低"的依据
+    public var minAchievableLatencyMs: Double
+
+    /// 音频缓冲调整的结果描述（例 `"BlackHole 16ch 512 → 256 帧"`）；
+    /// nil = 未调整（跟随系统 / 设备已是目标值 / 不支持）。
+    ///
+    /// 为什么要把"没调整"的原因也说出来：`preferredBufferFrames` 是全局设备属性，
+    /// 静默不生效会让用户以为"设了却没反应"（本项目最忌讳的那类问题）。
+    public var bufferDescription: String?
+
     /// 当前生效的**声道处理模式**（全断 / 直通 / 交换 / 混音）。
     ///
     /// 由引擎按 `ChannelSwapSettings.processingMode` 写入 —— **不要**让 UI 自己推导，
@@ -258,6 +292,19 @@ public struct ChannelSwapDiagnostics: Equatable, Sendable {
                 framesOut: Int64 = 0,
                 underruns: Int64 = 0,
                 renderFailures: Int64 = 0,
+                fillFrames: Int = 0,
+                fillMilliseconds: Double = 0,
+                peakFillFrames: Int = 0,
+                droppedStaleFrames: Int64 = 0,
+                startupAlignedFrames: Int64 = 0,
+                resyncCount: Int64 = 0,
+                targetFillFrames: Int = 0,
+                minAchievableLatencyMs: Double = 0,
+                bufferDescription: String? = nil,
+                averageFillFrames: Int = 0,
+                averageFillMilliseconds: Double = 0,
+                sampleRate: Double = 0,
+                starvedFrames: Int64 = 0,
                 activeFunction: ChannelProcessingFunction = .off,
                 mixDescription: String? = nil,
                 skipStatistics: String? = nil) {
@@ -274,6 +321,19 @@ public struct ChannelSwapDiagnostics: Equatable, Sendable {
         self.framesOut = framesOut
         self.underruns = underruns
         self.renderFailures = renderFailures
+        self.fillFrames = fillFrames
+        self.fillMilliseconds = fillMilliseconds
+        self.peakFillFrames = peakFillFrames
+        self.droppedStaleFrames = droppedStaleFrames
+        self.startupAlignedFrames = startupAlignedFrames
+        self.resyncCount = resyncCount
+        self.targetFillFrames = targetFillFrames
+        self.minAchievableLatencyMs = minAchievableLatencyMs
+        self.bufferDescription = bufferDescription
+        self.averageFillFrames = averageFillFrames
+        self.averageFillMilliseconds = averageFillMilliseconds
+        self.sampleRate = sampleRate
+        self.starvedFrames = starvedFrames
         self.activeFunction = activeFunction
         self.mixDescription = mixDescription
         self.skipStatistics = skipStatistics
@@ -330,5 +390,25 @@ public struct ChannelSwapDiagnostics: Equatable, Sendable {
             "CH\(ChannelSwapPlan.channelNumber(forAPIIndex: Int($0.element)))-I → "
                 + "CH\(ChannelSwapPlan.channelNumber(forAPIIndex: $0.offset))-O"
         }.joined(separator: "、")
+    }
+
+    // MARK: - 水位（延迟）文案 —— 与驱动层共用同一出处（`ChannelSwapFillText`）
+
+    /// 延迟主行，例 `"延迟 32ms（水位 1536 帧，目标 1440）"`
+    public var latencyText: String {
+        ChannelSwapFillText.describe(averageFillFrames: averageFillFrames,
+                                     averageMilliseconds: averageFillMilliseconds,
+                                     targetFillFrames: targetFillFrames)
+    }
+
+    /// 水位治理的"代价与事件"一行：丢旧帧数 + 欠载重置次数 + 峰值水位
+    public var fillMaintenanceText: String {
+        ChannelSwapFillText.maintenance(fillFrames: fillFrames,
+                                        milliseconds: fillMilliseconds,
+                                        peakFillFrames: peakFillFrames,
+                                        droppedStaleFrames: droppedStaleFrames,
+                                        startupAlignedFrames: startupAlignedFrames,
+                                        starvedFrames: starvedFrames,
+                                        resyncCount: resyncCount)
     }
 }

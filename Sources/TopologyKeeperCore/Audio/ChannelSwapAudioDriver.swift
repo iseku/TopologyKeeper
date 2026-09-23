@@ -47,6 +47,31 @@ public final class ChannelSwapAudioDriver: ChannelSwapAudioDriving, @unchecked S
     /// 512 是常见值，4096 覆盖绝大多数设备；再大也不至于分配失败。
     private static let maxFrames = 4096
 
+    /// 启动预填充最多等待的回调数（超时兜底：源端异常时不能让链路永久静音）。
+    ///
+    /// 正常情况下填满目标水位只需几个回调（48kHz 填 1440 帧 = 30ms ≈ 3 个回调），
+    /// 200 个回调（≈ 1~2 秒）是极宽裕的上限。
+    private static let maxPrefillCallbacks = 200
+
+    /// 运行平均水位的低通分母：一阶低通，时间常数 ≈ 64 个回调 ≈ 0.7 秒。
+    ///
+    /// 为什么需要平均：水位在一个回调内就会跳 512 帧（10.7ms）—— 刚消费完是 0、
+    /// 刚写完是 512。UI 直接显示瞬时值会让人以为"延迟忽大忽小"（真机反馈），
+    /// 而**平均水位才是"代表性延迟"**。瞬时值仍有价值，保留在 `tkctl` 诊断里。
+    static let fillAverageDivisor = 64
+
+    /// 死区的**最小**毫秒数（实际死区还会被"一个输出回调的帧数"顶上去）。
+    ///
+    /// ⚠️ 死区**绝不能**做成"某个远离目标的上限"（曾经写成"目标 30ms / 上限 90ms"）：
+    ///    那会造成**高位黏滞** —— 真机实测水位停在 3700 帧（77ms）、峰值 96ms
+    ///    后再也不动，因为水位只要没超过那个宽上限就永远不被修正。
+    ///    判据必须锚定**目标**，见 `resolveLatencyTarget`。
+    private static let deadbandMinMs = 8.0
+
+    /// 水位收敛的比例分母：每次回调最多丢掉"超出量"的 1/8。
+    /// 越大越平滑、收敛越慢；用比例而非一步到位，是为了不产生可听的跳变。
+    static let fillConvergenceDivisor = 8
+
     // MARK: 单元与缓冲
 
     private var inputUnit: AudioUnit?
@@ -118,6 +143,66 @@ public final class ChannelSwapAudioDriver: ChannelSwapAudioDriving, @unchecked S
     ///   · `renderFailures` 在涨            → 根本没读到
     ///     （典型：命令行进程被 TCC 拒绝读输入设备）
     private var sNonZeroInFrames: Int64 = 0
+
+    // MARK: 低目标水位（v0.1.4 修 BUG1）
+
+    /// 要维持的目标水位（帧）。`start()` 按**延迟目标**折算 ——
+    /// 见 `resolveLatencyTarget`（那里也说明了为什么实际压不到用户请求的 10ms）。
+    private var targetFillFrames = 0
+    /// 收敛死区（帧）：水位高于 `目标 + 死区` 即按比例丢最旧数据。
+    private var fillDeadbandFrames = 0
+
+    /// 用户在 `start()` 前设置的**延迟目标**（毫秒）。nil = 用配置默认值。
+    ///
+    /// 为什么用属性而不是 `start(...)` 的参数：`start` 的形参已经很多，
+    /// 而这是个可选调参 —— 见 `ChannelSwapAudioDriving.setTargetLatency`。
+    private var requestedLatencyMs: Double?
+
+    /// 实际可达到的**最低稳态延迟**（毫秒），供 UI 提示"设不到那么低"。
+    private var sMinAchievableLatencyMs: Double = 0
+
+    /// 启动预填充的进度：`-1` = 已结束/禁用；`>= 0` = 还在等水位涨到目标（记回调数）。
+    ///
+    /// 为什么需要它（真机四组对比实测）：装配后水位 = `min(首拍时的写入量, 目标)`，
+    /// 而"首拍时的写入量"取决于**输出设备从启动到第一次回调花了多久**
+    /// （HDMI/eARC 尤其慢，且每次都不一样）⇒ **同一个设置每次重启 TK 延迟都不同**：
+    /// 实测 48kHz/512 帧得到 21ms、192kHz/512 帧只有 13ms，都低于各自的目标 22ms。
+    /// 预填充把水位补齐到目标 ⇒ 延迟变成**确定的**。
+    private var sPrefillAttempts = -1
+
+    /// ★ **本轮装配**是否还没处理过第一次输出回调（`start()` 置 true，首拍后清零）。
+    ///
+    /// ⚠️ 这里曾经用累计计数 `sOutCallbacks <= 1` 判断，是个真机 bug：
+    ///    驱动实例由引擎持有、**跨装配复用**，`sOutCallbacks` 会一直累加
+    ///    ⇒ 那个条件只在 App 启动后的第一次装配成立，之后**每次切换模式都不对齐**，
+    ///    启动积压（HDMI 输出设备启动慢造成）就一直跟着链路跑。
+    ///    真机实测：水位峰值 117ms、丢旧 3541 帧（≈ 从 117ms 收敛回目标带的量），
+    ///    表现正是"切换模式后延迟会变"。
+    ///    ⇒ 判据必须是"**每次装配**重置"的标记，不能是进程级累计量。
+    private var pendingStartupAlignment = false
+
+    /// 欠载"重新居中"次数（每次都是一次事件性的数据跳变）
+    private var sResyncs: Int64 = 0
+    /// 为把水位拉回目标而丢弃的**最旧**帧数（低延迟的代价，必须可见）
+    private var sDroppedStaleFrames: Int64 = 0
+    /// ★ 首次输出回调"把水位对齐到目标"时丢掉的**启动积压**（帧）。
+    ///
+    /// ⚠️ 必须与 `sDroppedStaleFrames` **分开统计**：两者语义完全不同 ——
+    ///    前者只在装配后的第一拍出现一次（输入单元先起、HDMI 输出设备后起，
+    ///    这段时间的积压是"陈旧数据"），后者是运行期持续的漂移治理代价。
+    ///    混在一起会让用户把"一次性对齐"误读成"一直在丢"。
+    private var sStartupAlignedFrames: Int64 = 0
+    /// 观测到的水位峰值（帧）—— 用来回答"稳态到底积压了多少"
+    private var sPeakFillFrames = 0
+    /// ★ 运行**平均**水位（帧，一阶低通）：诊断显示"代表性延迟"用（见 `fillAverageDivisor`）
+    private var sAverageFillFrames = 0
+    /// ★ 因**数据不足**而被静音填充的帧数。
+    ///
+    /// 这是长期存在的**诊断盲区**：水位落在 `[frames/2, frames)` 时，每次回调都会把
+    /// 缺口 memset 成 0（音频里出现极短的空洞），但既不触发 `underruns`
+    /// （那个只在 `< frames/2` 时计数）也不触发 `resync` ⇒ **丢音却看不见**。
+    /// 真机观察到"水位长期贴地在 0/512 之间跳"时，必须靠这个数字判断有没有真损伤。
+    private var sStarvedFrames: Int64 = 0
     /// 每路输出的峰值（实时回调里就地取 abs 最大值，无分配）。
     ///
     /// ⚠️ **必须固定容量、只改元素**。曾经写成"按需 `sChannelPeaks = [Float](...)` 重新分配"，
@@ -150,6 +235,16 @@ public final class ChannelSwapAudioDriver: ChannelSwapAudioDriving, @unchecked S
     private var tonePhase: Int64 = 0
 
     // MARK: - 启动
+
+    /// 设置**延迟目标**（毫秒）—— 用户滑块的值，`start` 会据此解析水位参数。
+    ///
+    /// ⚠️ 这个方法必须存在（协议**不给**默认实现）。它曾经缺失过一整轮：
+    /// 协议带了个空默认实现、本类忘了覆盖 ⇒ 滑块设置被静默吞掉，
+    /// 真机上无论怎么拖滑块，目标水位恒为默认 30ms 对应的 1440 帧。
+    /// 现在"忘记实现"会直接编译不过，而不是让功能悄悄失效。
+    public func setTargetLatency(_ milliseconds: Double) {
+        requestedLatencyMs = milliseconds
+    }
 
     public func start(plan: ChannelSwapPlan,
                       input: ChannelSwapDeviceInfo,
@@ -233,9 +328,20 @@ public final class ChannelSwapAudioDriver: ChannelSwapAudioDriving, @unchecked S
         }
 
         // 环形缓冲：约 250ms。够吸收调度抖动，又不至于引入明显延迟。
+        // 环形缓冲：容量 0.25s（上取整到 2 的幂 = 48kHz 下 16384 帧），
+        // 但**稳态水位**由下面的 target/max 钳制在 30~90ms —— 见 BUG1 的说明。
         let capacityFrames = Int(sampleRate * 0.25)
         ring = SwapRingBuffer(capacity: capacityFrames, channels: take)
         prepareRenderBuffers(channels: srcChannels)
+
+        // ★ 低目标水位：延迟只能在**读侧**靠丢最旧数据降低，
+        //   所以这里给出目标与上限，交给 `renderFromRing` 每次回调按比例收敛。
+        // 延迟目标 → 水位参数。这里先用**保守估计**的回调帧数算一次；
+        // 真正的输出回调帧数要等第一次回调才知道，届时按真实值重算并重新对齐。
+        applyLatencyTarget(sampleRate: sampleRate, callbackFrames: Self.conservativeCallbackFrames(rate: sampleRate))
+        // 每次装配都重新武装"首拍对齐"与"启动预填充"（详见各自的说明）
+        pendingStartupAlignment = true
+        sPrefillAttempts = 0
 
         do {
             try setupInputUnit(device: input, sourceChannels: srcChannels)
@@ -294,6 +400,17 @@ public final class ChannelSwapAudioDriver: ChannelSwapAudioDriving, @unchecked S
         //    它只是诊断开关，生命周期由调用方管理，不该被 stop() 重置。
         selfTestPhase = 0
         sNonZeroInFrames = 0
+        sResyncs = 0
+        sDroppedStaleFrames = 0
+        sStartupAlignedFrames = 0
+        sPeakFillFrames = 0
+        sAverageFillFrames = 0
+        sStarvedFrames = 0
+        sPrefillAttempts = -1
+        targetFillFrames = 0
+        fillDeadbandFrames = 0
+        sMinAchievableLatencyMs = 0
+        pendingStartupAlignment = false
         for i in 0..<Self.maxReportChannels { sChannelPeaks[i] = 0 }
         if let inputUnit {
             AudioOutputUnitStop(inputUnit)
@@ -322,7 +439,23 @@ public final class ChannelSwapAudioDriver: ChannelSwapAudioDriving, @unchecked S
                               underruns: sUnderruns,
                               renderFailures: sRenderFailures,
                               channelPeaks: Array(sChannelPeaks.prefix(max(takeChannels, 0))),
-                              nonZeroInFrames: sNonZeroInFrames)
+                              nonZeroInFrames: sNonZeroInFrames,
+                              // ★ 水位（延迟）必须可观测：BUG1 就是"看不见水位"才拖了这么久。
+                              //   这三个量一起看就能回答"现在有多少延迟、有没有在收敛"。
+                              fillFrames: ring?.fillFrames ?? 0,
+                              fillMilliseconds: sampleRate > 0
+                                  ? Double(ring?.fillFrames ?? 0) / sampleRate * 1000 : 0,
+                              peakFillFrames: sPeakFillFrames,
+                              droppedStaleFrames: sDroppedStaleFrames,
+                              startupAlignedFrames: sStartupAlignedFrames,
+                              resyncCount: sResyncs,
+                              targetFillFrames: targetFillFrames,
+                              minAchievableLatencyMs: sMinAchievableLatencyMs,
+                              averageFillFrames: sAverageFillFrames,
+                              averageFillMilliseconds: sampleRate > 0
+                                  ? Double(sAverageFillFrames) / sampleRate * 1000 : 0,
+                              sampleRate: sampleRate,
+                              starvedFrames: sStarvedFrames)
     }
 
     // MARK: - 预分配
@@ -617,18 +750,22 @@ public final class ChannelSwapAudioDriver: ChannelSwapAudioDriving, @unchecked S
         let take = min(takeChannels, list.count)
         guard take > 0 else { return }
 
-        var start = 0
-        while start < frames {
-            let (pos, writable) = ring.beginWrite(frames, start: start)
+        // 分段：每写满一段就 `commitWrite`（写游标随之推进到下一段起点），
+        // 再带**剩余待写量**调下一段 —— 与 `beginWrite` 的新语义配套，不需要偏移参数。
+        var remaining = frames
+        var isFirstSegment = true
+        while remaining > 0 {
+            let (pos, writable) = ring.beginWrite(remaining)
             guard writable > 0 else { break }
-            // 首次写入才做"非零帧"抽样统计，避免第二段把同一批帧重复计入
-            let sampleStats = (start == 0)
+            // 源缓冲里的本段起点 = 总帧数 − 剩余量
+            let offset = frames - remaining
             for c in 0..<take {
                 guard let raw = list[c].mData else { continue }
-                memcpy(ring.plane(c) + pos, raw + start * MemoryLayout<Float>.size,
+                memcpy(ring.plane(c) + pos, raw + offset * MemoryLayout<Float>.size,
                        writable * MemoryLayout<Float>.size)
-                if sampleStats {
-                    // 抽样统计非零（每 16 帧取 1，实时线程上不做重活）
+                if isFirstSegment {
+                    // 抽样统计非零（每 16 帧取 1，实时线程上不做重活）。
+                    // ⚠️ 只在首段统计：第二段与首段是同一批帧的两半，两段都算会重复计入。
                     let p = raw.assumingMemoryBound(to: Float.self)
                     var nz = 0
                     var i = 0
@@ -638,8 +775,396 @@ public final class ChannelSwapAudioDriver: ChannelSwapAudioDriving, @unchecked S
             }
             ring.commitWrite(writable)
             sFramesIn += Int64(writable)
-            start += writable
+            remaining -= writable
+            isFirstSegment = false
         }
+    }
+
+    /// 渲染回调用的**混音装配参数**（值类型，按值传递）。
+    ///
+    /// 为什么单独成型：渲染回调与搬运实现之间要传 5 个标量，
+    /// 散着传容易漏（本项目已因"参数散落各处"错过多次）；打包成值类型后
+    /// 实时线程上零引用计数、零分配。
+    struct ChannelSwapMixParams: Equatable, Sendable {
+        /// 线性增益；**0 表示混音关闭**（此时其余字段无意义）
+        var gain: Float
+        /// 被衰减的那条上游的 plane 索引（API 0-based）
+        var sourceIndex: Int
+        /// 叠加目标输出声道（API 0-based）；−1 = 无
+        var targetIndex: Int
+        /// 与 `sourceIndex` 配对的那条上游（直通进 CH-O、不衰减）；−1 = 无
+        var directIndex: Int
+        /// 配对中"不是 CH-O"的那条下游声道（不连 ⇒ 静音）；−1 = 无
+        var cutIndex: Int
+
+        /// 不混音（交换 / 直通 / 混音计划不可用）
+        static let off = ChannelSwapMixParams(gain: 0, sourceIndex: 0,
+                                             targetIndex: -1, directIndex: -1, cutIndex: -1)
+    }
+
+    /// ★★ 环形缓冲 → 交错输出缓冲的**唯一**搬运实现（交换与混音共用）。
+    ///
+    /// ## 为什么必须独立成函数（这是一次真机静音回归换来的）
+    ///
+    /// 在此之前的写法是"两个分支各自遍历"：`if mixGain == 0 { 按置换表直取 }
+    /// else { 混音 }`。`ed3cc8e` 那次重构想把两条分支合并成同一套分段遍历，
+    /// 于是把无混音的搬运逻辑塞进了 `else` 内部 —— 但外层守卫 `mixGain != 0`
+    /// **忘了拆掉**。后果：`mixGain == 0`（交换 / 直通）时整段被跳过，
+    /// `ioData` 一个样本都没被写过 ⇒ **只有混音模式出声，交换与直通全静音**。
+    ///
+    /// 当时没人拦住的直接原因：`handleOutput` 是私有的、只能由真实音频回调驱动，
+    /// 单测（走 `ChannelSwapMocks`）根本走不到这段 ⇒ CI 全绿、真机哑。
+    ///
+    /// ⇒ 现在唯一实现是本函数（internal + 纯参数 ⇒ 单测可直接调），
+    ///   并有 `ChannelSwapRenderTests` 的"哨兵"用例锁死
+    ///   **每一帧、每个声道都必须被显式写入**。
+    ///
+    /// ⚠️ 因此这里**不允许**再出现任何"按功能开关整体跳过搬运"的分支：
+    ///   功能开关只能决定**每个声道怎么取值**，不能决定**要不要写**。
+    ///
+    /// ## 分段（物理回绕）
+    ///
+    /// 一次 `beginRead` 可能跨过平面回绕点，此时 `[pos, capacity)` 与 `[0, 余量)`
+    /// 是两段互不连续的内存。旧实现把 `read` 帧当一段连续内存去读
+    /// `plane(c) + pos`，回绕点读到的是**下一个 plane 的开头**（声道内容错位）。
+    ///
+    /// ## 实时线程纪律
+    ///
+    /// 只用指针算术与按值传递的值类型，**不分配、不加锁、不写日志、不查表**。
+    @inline(__always)
+    static func copyRingToInterleaved(ring: SwapRingBuffer,
+                                      dst: UnsafeMutablePointer<Float>,
+                                      stride: Int,
+                                      usable: Int,
+                                      frames: Int,
+                                      read: Int,
+                                      permute: [Int],
+                                      mix: ChannelSwapMixParams) {
+        // 混音只在装配成功时才有 plane；`gain == 0` 时两者均为 nil ⇒ 走直取分支。
+        //
+        // ★ 与 `sourceIndex` 配对的那条上游（直通、不衰减）：
+        //   仅当它与被衰减那条确实是**不同**的 plane 时才叠加 —— 否则
+        //   `a×g + a` 会变成纯电平翻倍（配对相同本身就是配置错误）。
+        let mixSourcePlane: UnsafeMutablePointer<Float>? =
+            mix.gain != 0 ? ring.plane(mix.sourceIndex) : nil
+        let mixDirectPlane: UnsafeMutablePointer<Float>? =
+            (mix.gain != 0 && mix.directIndex >= 0 && mix.directIndex != mix.sourceIndex)
+            ? ring.plane(mix.directIndex) : nil
+
+        // ★★ 混音语义（用户明确定义，2026-09）：
+        //
+        //   CH-I = 被施加衰减的那条**上游**声道（配置项）
+        //   CH-O = 下游输出声道；**CH-O 自己那条内容直通、不衰减**，
+        //          另条上游（未被选中的那条）也直通、不衰减
+        //   两条上游**都进 CH-O**，只是被选中的那条乘 gain、另一条直通。
+        //
+        //   选 CH-I=3:  CH4-O = CH4-I（直通） + CH3-I × gain
+        //   选 CH-I=4:  CH4-O = CH3-I（直通） + CH4-I × gain
+        //   CH3-O（非 CH-O 的那条）不连 ⇒ 静音
+        //
+        // 两个空间（用户提出的命名，勿混）：
+        //   上游 plane：CH3-I/CH4-I  ← 只读
+        //   下游输出：  CH3-O/CH4-O  ← 只写
+        //
+        // ⚠️ 已走过的四次错误（都被用户逐条纠正）：
+        //   ① 用上游索引决定衰减哪条下游声道 → 衰减落错声道；
+        //   ② 对下游目标整体再乘增益 → 把该条的直通内容也压小了；
+        //   ③ 没切断上游那条的输出 → 未衰减信号从 CH3-O 漏出；
+        //   ④ 把"被衰减的"与"直通的"搞反 → 衰减加在了不该加的那条上。
+        // 分段：每读满一段就 `commitRead`（读游标随之推进到下一段起点），
+        // 再带剩余待读量调下一段 —— 与 `writeToRing` 完全对称。
+        var remaining = read
+        while remaining > 0 {
+            let seg = ring.beginRead(remaining)
+            guard seg.readable > 0 else { break }
+            let pos = seg.pos
+            let count = seg.readable
+            // 本段在 dst 里的起始帧 = 总帧数 − 剩余量
+            let baseFrame = read - remaining
+            for f in 0..<count {
+                let base = (baseFrame + f) * stride
+                for c in 0..<usable {
+                    // ★ 交换在这里发生：目标第 c 声道取源第 permute[c] 声道
+                    //   （permute 已预计算，长度 = takeChannels；恒等即不交换）
+                    let srcCh = (c < permute.count) ? permute[c] : c
+                    if mix.gain != 0, c == mix.targetIndex, let src = mixSourcePlane {
+                        // CH-O：被选中那条 × gain  +  另一条 × 1
+                        let rate = (src + pos)[f] * mix.gain
+                        var direct: Float = 0
+                        if let dp = mixDirectPlane { direct = (dp + pos)[f] }
+                        dst[base + c] = rate + direct
+                    } else if mix.gain != 0, c == mix.cutIndex {
+                        // 配对中不是 CH-O 的那条：不连 ⇒ 静音
+                        dst[base + c] = 0
+                    } else {
+                        // ★ 无混音（交换 / 直通）：按置换表直取。
+                        //   ⚠️ 这条分支**必须**在 mixGain == 0 时也执行 ——
+                        //      它一度被外层 `if mixGain != 0` 挡住，见函数头注释。
+                        dst[base + c] = (ring.plane(srcCh) + pos)[f]
+                    }
+                }
+                if usable < stride { for c in usable..<stride { dst[base + c] = 0 } }
+            }
+            ring.commitRead(count)
+            remaining -= count
+        }
+    }
+
+    /// 渲染回调"正常分支"的统计输出（值类型，栈上传递、零分配）。
+    struct RenderCounters: Equatable, Sendable {
+        /// 欠载次数（目标钟快于源）
+        var underruns: Int64 = 0
+        /// 欠载后"重新居中"的实际次数（每次都是一次数据跳变）
+        var resyncs: Int64 = 0
+        /// 为把水位拉回目标而丢弃的最旧帧数
+        var droppedStaleFrames: Int64 = 0
+        /// 首次回调对齐水位时丢掉的启动积压（帧）
+        var startupAlignedFrames: Int64 = 0
+        /// 因数据不足被静音填充的帧数
+        var starvedFrames: Int64 = 0
+        /// 本次观测到的水位峰值（帧）
+        var peakFillFrames: Int = 0
+    }
+
+    /// ★★ 渲染回调**正常分支的主体**（`internal` ⇒ 单测可直接驱动）。
+    ///
+    /// 职责：水位收敛 → 取数 → 欠载兜底 → 搬进 `dst` → 余量清零 → 提交读游标。
+    ///
+    /// ## 为什么把整段都放进来（而不是只抽"搬运"）
+    ///
+    /// v0.1.3 的静音回归形态是"**搬运调用点**被 `if mixGain != 0` 包住"。
+    /// 只把搬运抽成内部函数、测试直接调它，**抓不到"调用点被守卫"这类回归**。
+    /// ⇒ 因此这里连水位判定与 `commitRead` 一起纳入，测试驱动的是整段正常路径。
+    /// `handleOutput` 只剩下"自测分支 vs 正常分支"的选择与逐路峰值测量。
+    ///
+    /// ## 低目标水位（BUG1 的修法）
+    ///
+    /// 延迟只能靠**推进读游标**降低：写侧丢新块只能阻止水位继续上涨，
+    /// 永远无法把已经积压的延迟收回来。因此：
+    /// * 水位超过 `目标 + 死区` 时，按比例丢弃**最旧**数据（分多个回调缓慢收敛，
+    ///   而不是一步跳回目标 ⇒ 不产生可听的跳变）；
+    /// * **首次输出回调**把水位一次性对齐到目标，丢掉启动期积压（见下方说明）；
+    /// * 水位在目标附近时**不动手**（死区），否则会追着噪声调。
+    @discardableResult
+    @inline(__always)
+    static func renderFromRing(ring: SwapRingBuffer,
+                               dst: UnsafeMutablePointer<Float>,
+                               stride: Int,
+                               usable: Int,
+                               frames: Int,
+                               permute: [Int],
+                               mix: ChannelSwapMixParams,
+                               targetFillFrames: Int,
+                               deadbandFrames: Int,
+                               isFirstOutputCallback: Bool,
+                               averageFillFrames: inout Int,
+                               prefillAttempts: inout Int,
+                               counters: inout RenderCounters) -> Int {
+        counters.peakFillFrames = max(counters.peakFillFrames, ring.fillFrames)
+
+        // ★ 运行平均水位（一阶低通，只在 RT 线程写）：诊断用它显示"代表性延迟"，
+        //   避免把"一个回调内的 512 帧锯齿"当成延迟在忽大忽小。
+        // ⚠️ 必须**四舍五入**而不是直接截断整除：整数低通在接近目标时增量会被截断成 0，
+        //    平均水位会永远停在距真实水位最多 `divisor-1` 帧的地方（实测停滞在 961/1024，
+        //    偏差 63 帧）。四舍五入后偏差 ≤ divisor/2（约 0.7ms，诊断足够精确）。
+        let fillDelta = ring.fillFrames - averageFillFrames
+        averageFillFrames += (fillDelta + (fillDelta >= 0 ? fillAverageDivisor / 2
+                                                          : -(fillAverageDivisor / 2)))
+            / fillAverageDivisor
+
+        // ★★ 首次输出回调：把水位**一次性对齐到目标**。
+        //
+        //   为什么必须做：输入单元先启动、输出设备后启动，而 HDMI/eARC 设备
+        //   从 start 到第一次回调可能慢几十毫秒 —— 这段时间输入已经把 ring
+        //   灌到几十甚至上百毫秒的水位（真机实测峰值 96ms）。
+        //   此刻**还没有任何音频播出**，直接对齐不会产生可听的不连续；
+        //   放任不管的话，这段积压会一直跟着整条链路（真机实测：
+        //   切换模式后延迟从 30ms 跳到 77~96ms，而且再也不会自己回来）。
+        //
+        //   ⚠️ 对齐量单独计入 `startupAlignedFrames`（与运行期收敛的
+        //      `droppedStaleFrames` 分开）：它确实是"被丢掉的数据"、必须可见，
+        //      但语义完全不同 —— **只在装配后的第一拍出现一次、之后不增长**。
+        if isFirstOutputCallback, targetFillFrames > 0 {
+            let before = ring.fillFrames
+            ring.resync(targetFillFrames)
+            let aligned = before - ring.fillFrames
+            if aligned > 0 { counters.startupAlignedFrames += Int64(aligned) }
+        }
+
+        // ── 启动预填充：水位还没到目标就先静音等待、**不消费** ────────────
+        //
+        //   不消费是必须的：消费就等于把刚积累的数据立刻读走，水位永远填不满。
+        //   代价是装配后多几十毫秒静音 —— 但切换模式本来就有短暂中断，
+        //   用户对这一小段无感知；换来的是"每次装配后的延迟都等于目标"。
+        if prefillAttempts >= 0, targetFillFrames > 0 {
+            if ring.fillFrames >= targetFillFrames {
+                prefillAttempts = -1                       // 达标：开始正常消费
+            } else if prefillAttempts < Self.maxPrefillCallbacks {
+                prefillAttempts += 1
+                // 不计数 `starvedFrames`：这是**主动等待**，不是数据不足造成的损伤
+                memset(dst, 0, frames * stride * MemoryLayout<Float>.size)
+                return 0
+            } else {
+                // 超时兜底：源端异常/漂移极大时永远填不满 —— 宁可带着偏低的水位跑，
+                // 也不能把链路永久静音（那是"静默失效"里最严重的一种）
+                prefillAttempts = -1
+            }
+        }
+
+        let fill = ring.fillFrames
+        if targetFillFrames > 0, fill > targetFillFrames + deadbandFrames {
+            let drop = Self.staleDropFrames(fill: fill,
+                                            target: targetFillFrames,
+                                            deadband: deadbandFrames,
+                                            limit: frames)
+            if drop > 0 {
+                counters.droppedStaleFrames += Int64(ring.discardStale(drop))
+            }
+        }
+
+        // ⚠️⚠️ 可读总量必须取 `fillFrames`（= 写游标 − 读游标）。
+        //      **不能**用 `beginRead` 的第三个返回值 —— 那是"**单段**可读帧数"
+        //      （被 `capacity - pos` 截断），而它曾被当成总长用（`ed3cc8e` 改签名时
+        //      留下的语义错位），后果是：
+        //        · 本次只消费了 `capacity - pos` 帧，其余被 memset 清零 ⇒ **周期性静音**；
+        //        · 消费量长期少于写入量 ⇒ 水位持续上涨 ⇒ 低水位收敛不停丢旧数据。
+        //      真机表现："声音有规律断续 + 丢旧一直涨，切换几次又好了"。
+        //
+        //      为什么"切换几次又好"：`frames` 整除 `capacity` 时（512 | 16384）
+        //      读游标永远落在 512 的整数倍上，`capacity - pos ≥ frames` 恒成立 ⇒ 从不截断；
+        //      一旦低水位收敛用**非对齐步长**推进过读游标，相位被打乱，
+        //      此后每个容量周期都会撞进那个窗口。重新装配会重建 ring（相位归零）⇒ 暂时正常。
+        let available = ring.fillFrames
+        let read = min(frames, available)
+
+        // 水位过低（目标钟快于源）→ 欠载，重新居中避免持续"半空"
+        if available < frames / 2 {
+            counters.underruns += 1
+            if available < frames {
+                ring.resync(frames)
+                counters.resyncs += 1
+            }
+        }
+
+        if read > 0 {
+            // ★★ 搬运只有这一处实现（`copyRingToInterleaved`），交换与混音共用。
+            //
+            //   ⚠️ 绝不能再在这里加 `if mixGain != 0` 这类"按功能开关整体跳过"的守卫：
+            //      交换/直通模式下 `mixGain == 0`，那样写会让 dst 一个样本都不写
+            //      ⇒ **整条链路静音**。v0.1.3 的真机回归就是这么来的
+            //      （用户实测："只有混音模式出声，交换与直通都没有声音"）。
+            copyRingToInterleaved(ring: ring,
+                                  dst: dst,
+                                  stride: stride,
+                                  usable: usable,
+                                  frames: frames,
+                                  read: read,
+                                  permute: permute,
+                                  mix: mix)
+            // 余量必须清零：绝不能把未初始化内存送进设备（会爆音）
+            if read < frames {
+                // ★ 这段静音是"数据不足"的真实损伤，必须计数（见 `sStarvedFrames`）
+                counters.starvedFrames += Int64(frames - read)
+                memset(dst + read * stride, 0, (frames - read) * stride * MemoryLayout<Float>.size)
+            }
+        } else {
+            // ★ 整块静音（连一帧数据都没有）**同样必须计数**。
+            //   早先这里漏了：于是"欠载重置 N 次"看起来"静音填充 0 帧"，
+            //   而每次欠载实际都是一整块（512 帧）静音 —— 真机在 192kHz 下
+            //   出现 4 次重置时就是把 4 块静音显示成了 0。丢音不能因为走的是
+            //   else 分支就隐形。
+            counters.starvedFrames += Int64(frames)
+            memset(dst, 0, frames * stride * MemoryLayout<Float>.size)
+        }
+
+        // 读游标已由 `copyRingToInterleaved` 逐段提交（见那里的说明）
+        return read
+    }
+
+    /// 按延迟目标解析出水位参数（并记录"实际可达最低延迟"）。
+    ///
+    /// ⚠️ 必须在**首拍**用真实的输出回调帧数再算一次：水位至少要装得下一个
+    ///    输出回调（否则每次回调都欠载），而回调帧数只有运行时才知道。
+    private func applyLatencyTarget(sampleRate rate: Double, callbackFrames: Int) {
+        let r = resolveCurrentLatencyTarget(sampleRate: rate, callbackFrames: callbackFrames)
+        targetFillFrames = r.target
+        fillDeadbandFrames = r.deadband
+        sMinAchievableLatencyMs = r.minAchievableMs
+    }
+
+    /// 用**当前请求值**（`setTargetLatency` 写入的值）解析水位参数。
+    ///
+    /// ⚠️ 独立成 `internal` 方法**只为可测**：`setTargetLatency` → 这里 → 水位参数
+    /// 是真机上曾经整段断掉的那条链路（协议给了空默认实现，本类忘了覆盖），
+    /// 而当时没有任何测试覆盖它 —— 纯函数测试再绿也发现不了。
+    func resolveCurrentLatencyTarget(sampleRate rate: Double, callbackFrames: Int)
+        -> (target: Int, deadband: Int, minAchievableMs: Double) {
+        let requested = requestedLatencyMs ?? ChannelSwapSettings.defaultTargetLatencyMs
+        return Self.resolveLatencyTarget(sampleRate: rate,
+                                         requestedMs: requested,
+                                         callbackFrames: callbackFrames)
+    }
+
+    /// 把"延迟目标"解析成水位参数（**纯函数 ⇒ 可单测**）。
+    ///
+    /// 三条约束决定了实际能压到多低：
+    /// 1. **死区 ≥ 一个输出回调**：一个回调就一次性读走整个缓冲，死区比它小
+    ///    会让水位在正常抖动下反复穿越阈值、把丢弃碎片化；
+    /// 2. **水位 ≥ 2 个回调**：低于此值几乎每次回调都贴着欠载边缘；
+    /// 3. 稳态延迟 ≈ **目标水位 + 死区**（丢弃把水位压在阈值下方一点点）。
+    ///
+    /// ⇒ **实际最低平均延迟 = 2×回调 / 采样率**（水位下沿没有控制，
+    ///   稳态平均水位就贴在目标水位 = 2×回调 上；死区只决定"上沿多久丢一次"，
+    ///   不决定平均延迟）。本机 512 帧回调、48kHz 下 ≈ **21ms**；
+    ///   把设备缓冲改成 256 帧则 ≈ **11ms**。
+    ///
+    /// - Returns: `target`（目标水位帧）、`deadband`（死区帧）、
+    ///   `minAchievableMs`（实际最低稳态延迟）
+    static func resolveLatencyTarget(sampleRate: Double,
+                                     requestedMs: Double,
+                                     callbackFrames: Int)
+        -> (target: Int, deadband: Int, minAchievableMs: Double) {
+        let rate = max(sampleRate, 1)
+        let callback = max(callbackFrames, 1)
+        let requested = min(max(requestedMs, ChannelSwapSettings.latencyRangeMs.lowerBound),
+                            ChannelSwapSettings.latencyRangeMs.upperBound)
+        let deadband = max(callback, Int(rate * deadbandMinMs / 1000))
+        let minFill = 2 * callback
+        // ★ 目标水位**直接**对应请求的延迟（"设多少就是多少"）。
+        //   ⚠️ 这里曾经是 `请求 − 死区`，于是用户设 30ms 实际只得到 22ms 的水位目标，
+        //      再叠加"装配时水位可能填不满"，就用真机出现了
+        //      "设 30ms 实际 13ms/21ms、改缓冲也没反应"这种无法解释的现象。
+        //      死区只决定**上沿多久丢一次**，不该参与"目标是多少"。
+        let target = max(Int(rate * requested / 1000), minFill)
+        // ★ 可达的**平均**延迟基准是"目标水位"，不是"目标 + 死区"：
+        //   死区只是**丢弃阈值（上沿）**，水位并不会停在它那里 ——
+        //   下沿没有任何控制，稳态平均水位就贴在目标水位附近。
+        //   早期按"目标 + 死区"算，于是 UI 显示"设备最低 32ms"而真机实测 21ms，
+        //   又是一次"显示的与跑的不是一回事"。
+        let minAchievableMs = Double(minFill) / rate * 1000
+        return (target, deadband, minAchievableMs)
+    }
+
+    /// 首拍之前用的**保守**回调帧数估计（约 10.7ms：常见设备缓冲）。
+    static func conservativeCallbackFrames(rate: Double) -> Int {
+        max(Int(rate * 0.011), 1)
+    }
+
+    /// 低水位收敛策略（**纯函数 ⇒ 可单测**）：本次回调应当丢弃多少**最旧**帧。
+    ///
+    /// * 水位未超过 `目标 + 死区` → 0（死区：目标附近绝不动作，否则会追噪声）
+    /// * 否则丢掉"超出目标部分"的 `1/fillConvergenceDivisor`，
+    ///   至少 1 帧、至多 `limit` 帧 —— 分多个回调缓慢收敛，避免一次跳变。
+    ///
+    /// ⚠️ 判据是 **`目标 + 死区`**，不是"某个远离目标的上限"：用后者会高位黏滞 ——
+    ///    水位只要没超过那个上限就永远不被修正（真机实测停在 77ms 不动）。
+    static func staleDropFrames(fill: Int, target: Int, deadband: Int, limit: Int) -> Int {
+        guard target >= 0, deadband >= 0, limit > 0 else { return 0 }
+        guard fill > target + deadband else { return 0 }
+        let excess = fill - target
+        guard excess > 0 else { return 0 }
+        let proportional = excess / fillConvergenceDivisor
+        return min(max(proportional, 1), limit)
     }
 
     /// 渲染回调：环形缓冲 → 交错输出缓冲（**交换在本回调内按置换表完成**）
@@ -699,103 +1224,50 @@ public final class ChannelSwapAudioDriver: ChannelSwapAudioDriving, @unchecked S
             return noErr
         }
 
-        let (_, available, read) = ring.beginRead(frames, start: 0)
+        // ★★ 正常分支整体交给 `renderFromRing`（internal ⇒ 单测可直接驱动）。
+        //
+        //   为什么连"取水位 / 欠载判定 / 提交读游标"都搬进去、而不是只搬"取样本"：
+        //   v0.1.3 的静音回归形态是**搬运调用点被 `if mixGain != 0` 包住**。
+        //   只把搬运抽成函数、测试直接调它，抓不到"调用点被守卫"这类回归 ——
+        //   必须让测试驱动**整段正常分支**才算锁住。
+        // ★ 首拍对齐按"每次装配"判断：`start()` 置位，这里消费一次。
+        //   ⚠️ 绝不要改回 `sOutCallbacks <= 1`（跨装配累加 ⇒ 只生效一次）。
+        let isFirstOutputCallback = pendingStartupAlignment
+        pendingStartupAlignment = false
 
-        // 水位过低（目标钟快于源）→ 欠载，重新居中避免持续"半空"
-        if available < frames / 2 {
-            sUnderruns += 1
-            if available < frames { ring.resync(frames) }
+        // ★ 首拍：用**真实**的输出回调帧数重算水位参数。
+        //   水位至少要装得下一个回调，而回调帧数运行时才知道 ⇒
+        //   这里重算一次，然后由 `renderFromRing` 的首次对齐按新目标归位。
+        if isFirstOutputCallback {
+            applyLatencyTarget(sampleRate: sampleRate, callbackFrames: frames)
         }
 
-        if read > 0 {
-            // ★ 交换在这里发生：目标第 c 声道取源第 permute[c] 声道
-            //   （permute 已预计算，长度 = takeChannels；恒等即不交换）
-            if mixGain != 0 {
-                // ★★ 混音（LFE → 目标声道）：**零分配**的一次乘加。
-                //
-                //    为什么能这么简单：环形缓冲是 **planar**（每声道一个 plane），
-                //    所以"把低音混进某条声道"就是"读两个 plane 再相加"，
-                //    不需要任何中间数组、不 memcpy。
-                //
-                //    ⚠️ 绝不能在实时回调里构造 Swift 数组（会分配 → 可能加锁/缺页 → 爆音）。
-                //    本分支只用指针算术。
-                //    ★★ 混音语义（用户明确定义，2026-09）：
-                //
-                //      CH-I = 被施加衰减的那条**上游**声道（配置项）
-                //      CH-O = 下游输出声道；**CH-O 自己那条内容直通、不衰减**，
-                //             另条上游（未被选中的那条）也直通、不衰减
-                //      两条上游**都进 CH-O**，只是被选中的那条乘 gain、另一条直通。
-                //
-                //      选 CH-I=3:  CH4-O = CH4-I（直通） + CH3-I × gain
-                //      选 CH-I=4:  CH4-O = CH3-I（直通） + CH4-I × gain
-                //      CH3-O（非 CH-O 的那条）不连 ⇒ 静音
-                //
-                //    两个空间（用户提出的命名，勿混）：
-                //      上游 plane：CH3-I/CH4-I  ← 只读
-                //      下游输出：  CH3-O/CH4-O  ← 只写
-                //
-                //    传递函数（c = 输出声道序号）：
-                //      c == mixTargetIndex : rateIdx 那条 × gain  +  另一条 × 1
-                //                            其中另一条 = 与 mixSourceIndex 配对的上游声道
-                //      其它声道            : 静音（本次配置下只有 CH-O 出声）
-                //
-                //    ⚠️ 已走过的四次错误（都被用户逐条纠正）：
-                //      ① 用上游索引决定衰减哪条下游声道 → 衰减落错声道；
-                //      ② 对下游目标整体再乘增益 → 把该条的直通内容也压小了；
-                //      ③ 没切断上游那条的输出 → 未衰减信号从 CH3-O 漏出；
-                //      ④ 把"被衰减的"与"直通的"搞反 → 衰减加在了不该加的那条上。
-                let mixSourcePlane = ring.plane(mixSourceIndex)
-                // ★ 与 `mixSourceIndex` 配对的那条上游（直通、不衰减）。
-                //   仅当它与衰减那条确实是**不同**的 plane 时才叠加 —— 否则
-                //   `(a×g + a)` 会变成纯电平翻倍（配对相同即是配置错误）。
-                let mixDirectPlane: UnsafeMutablePointer<Float>? =
-                    (mixDirectIndex >= 0 && mixDirectIndex != mixSourceIndex)
-                    ? ring.plane(mixDirectIndex) : nil
-                // ★ 混音分支与无混音分支共用同一套**分段**遍历：
-                //   一次 `beginRead` 可能跨过平面回绕点，此时 `[pos, capacity)` 与
-                //   `[0, 余量)` 是两段互不连续的内存（见 `writeToRing` 的说明）。
-                //   旧实现把 `read` 帧当成一段连续内存去读 `plane(c) + pos`，
-                //   于是回绕点读到的是**下一个 plane 的开头**（声道内容错位）。
-                var segStart = 0
-                while segStart < read {
-                    let seg = ring.beginRead(frames, start: segStart)
-                    guard seg.readable > 0 else { break }
-                    let pos = seg.pos
-                    let count = seg.readable
-                    for f in 0..<count {
-                        let base = (segStart + f) * stride
-                        for c in 0..<usable {
-                            let srcCh = (c < permute.count) ? permute[c] : c
-                            if c == mixTargetIndex {
-                                // CH-O：被选中那条 × gain  +  另一条 × 1
-                                let rate = (mixSourcePlane + pos)[f] * mixGain
-                                let direct = mixDirectPlane.map { ($0 + pos)[f] } ?? 0
-                                dst[base + c] = rate + direct
-                            } else if c == mixCutIndex {
-                                // 配对中不是 CH-O 的那条：不连 ⇒ 静音
-                                dst[base + c] = 0
-                            } else {
-                                dst[base + c] = (ring.plane(srcCh) + pos)[f]
-                            }
-                        }
-                        if usable < stride { for c in usable..<stride { dst[base + c] = 0 } }
-                    }
-                    segStart += count
-                }
-            }
-            // 余量必须清零：绝不能把未初始化内存送进设备（会爆音）
-            if read < frames {
-                memset(dst + read * stride, 0, (frames - read) * stride * MemoryLayout<Float>.size)
-            }
-        } else {
-            memset(dst, 0, frames * stride * MemoryLayout<Float>.size)
-        }
-
-
-        measurePeaks(frames: read)
-
-        ring.commitRead(read)
+        var counters = RenderCounters()
+        let read = Self.renderFromRing(ring: ring,
+                                      dst: dst,
+                                      stride: stride,
+                                      usable: usable,
+                                      frames: frames,
+                                      permute: permute,
+                                      mix: ChannelSwapMixParams(gain: mixGain,
+                                                                sourceIndex: mixSourceIndex,
+                                                                targetIndex: mixTargetIndex,
+                                                                directIndex: mixDirectIndex,
+                                                                cutIndex: mixCutIndex),
+                                      targetFillFrames: targetFillFrames,
+                                      deadbandFrames: fillDeadbandFrames,
+                                      isFirstOutputCallback: isFirstOutputCallback,
+                                      averageFillFrames: &sAverageFillFrames,
+                                      prefillAttempts: &sPrefillAttempts,
+                                      counters: &counters)
+        sUnderruns += counters.underruns
+        sResyncs += counters.resyncs
+        sDroppedStaleFrames += counters.droppedStaleFrames
+        sStartupAlignedFrames += counters.startupAlignedFrames
+        sStarvedFrames += counters.starvedFrames
+        if counters.peakFillFrames > sPeakFillFrames { sPeakFillFrames = counters.peakFillFrames }
         sFramesOut += Int64(read)
+        measurePeaks(frames: read)
         return noErr
     }
 }
@@ -868,22 +1340,29 @@ final class SwapRingBuffer: @unchecked Sendable {
         store + channel * capacity
     }
 
-    /// 开始写入，返回**回绕后**的起点与**单段**可写帧数。
+    /// 开始写入一段：返回**回绕后**的起点与这一段的帧数上限。
     ///
-    /// - Parameter frames: 本次希望写入的帧数（会被剩余空间再次截断）
-    /// - Parameter start: 本次实际起始的 plane 位置（**必须是提交给本方法的那一段的
-    ///   起点**）。第一段传 0，第二段传上一段的终点。
+    /// - Parameter frames: **这一段**最多想写多少帧（传"本次回调的剩余待写量"）
     ///
-    /// ⚠️ 返回的 `writable` 同时被两件事截断：总剩余空间，以及**本次调用起点到
-    ///    平面末尾的距离**。调用方必须把"写满这段"与"再调一次写第二段"分开，
-    ///    绝不能拿 `pos + writable` 当作连续内存 —— 那正是本文件修复过的越界缺陷
-    ///    （`plane(c) + pos` 在回绕点越过平面边界，末声道直接写出 `store` 分配区）。
-    @inline(__always) func beginWrite(_ frames: Int, start: Int) -> (pos: Int, writable: Int) {
+    /// ⚠️ 返回的 `writable` 被两件事截断：总剩余空间，以及**起点到平面末尾的距离**。
+    ///    写满这一段后**必须** `commitWrite`，再带着新的剩余量调用下一段；
+    ///    绝不能拿 `pos + writable` 当作连续内存（那正是本文件修过的越界缺陷）。
+    ///
+    /// ⚠️⚠️ 这里曾经带一个 `start:`（"已处理帧数"）参数，但**写侧每段都会
+    ///    `commitWrite`**、读侧又**不**逐段 `commitRead` —— 两侧语义相反，
+    ///    于是 `pos = (游标 & mask) + start` 在回绕点必然算错：
+    ///      · 写侧：游标已推进，再加 `start` ⇒ 第二段写到了**错误位置**；
+    ///      · 读侧：`pos` 可能等于 `capacity` ⇒ `capacity - pos == 0`
+    ///        ⇒ 那一段被判成"没有可读数据"而**静默丢弃**（真机表现为
+    ///        周期性静音 + 丢旧帧数一直涨）。
+    ///    ⇒ 现在两侧统一为"**每段提交、只传剩余量**"，游标本身就是下一段的起点，
+    ///      `pos = 游标 & mask` 在任何相位下都成立。
+    @inline(__always) func beginWrite(_ frames: Int) -> (pos: Int, writable: Int) {
         let w = writeIndex.pointee
         let space = capacity - Int(w - readIndex.pointee)
         let want = min(frames, space)
         guard want > 0 else { return (0, 0) }
-        let pos = (Int(w) & mask) &+ start
+        let pos = Int(w) & mask
         return (pos, min(want, capacity - pos))
     }
 
@@ -891,19 +1370,22 @@ final class SwapRingBuffer: @unchecked Sendable {
         writeIndex.pointee = writeIndex.pointee &+ Int64(frames)
     }
 
-    /// 开始读取，返回**回绕后**的起点、可读总量与**单段**可读帧数。
+    /// 开始读取一段：返回回绕后的起点、**当前**可读总量与这一段的帧数上限。
     ///
-    /// - Parameter start: 同 `beginWrite`，第二段传上一段的终点。
+    /// - Parameter frames: **这一段**最多想读多少帧（传"本次回调的剩余待读量"）
     ///
-    /// ⚠️ `readable` 同样被"到平面末尾的距离"截断；但读侧越过平面边界不会越出
-    ///    `store` 分配区（只会读到下一个 plane 的开头），所以它此前不会崩，
-    ///    只表现为声道内容错位 —— 同样必须分段修掉。
-    @inline(__always) func beginRead(_ frames: Int, start: Int) -> (pos: Int, available: Int, readable: Int) {
+    /// ⚠️ 与 `beginWrite` 完全对称：读满这段后 `commitRead`，再带新的剩余量调用下一段。
+    ///    详见 `beginWrite` 里关于 `start:` 参数为何被删掉的说明。
+    ///
+    /// ⚠️ 第二个返回值是**这一刻**的可读总量（`写游标 − 读游标`）；第三个才是
+    ///    这一段的上限（可能被平面末尾截断）。**求"本次能消费多少"要用前者**，
+    ///    历史上错用过后者（见 `renderFromRing` 的说明）。
+    @inline(__always) func beginRead(_ frames: Int) -> (pos: Int, available: Int, readable: Int) {
         let r = readIndex.pointee
         let available = Int(writeIndex.pointee - r)
         let want = min(frames, available)
         guard want > 0 else { return (0, available, 0) }
-        let pos = (Int(r) & mask) &+ start
+        let pos = Int(r) & mask
         return (pos, available, min(want, capacity - pos))
     }
 
@@ -911,8 +1393,30 @@ final class SwapRingBuffer: @unchecked Sendable {
         readIndex.pointee = readIndex.pointee &+ Int64(frames)
     }
 
-    /// 水位失控后重新居中到"最近的 frames 帧"
+    /// 丢弃 `frames` 帧**最旧**数据（推进读游标），返回实际丢弃帧数。
+    ///
+    /// 低水位收敛用它：降低延迟的唯一方向是"让消费者跳过已积压的旧数据"，
+    /// 而写侧丢新块只能阻止水位继续上涨。丢弃量由
+    /// `ChannelSwapAudioDriver.staleDropFrames` 按比例给出，不会一步跳回目标。
+    @discardableResult
+    @inline(__always) func discardStale(_ frames: Int) -> Int {
+        let n = min(max(frames, 0), fillFrames)
+        guard n > 0 else { return 0 }
+        readIndex.pointee = readIndex.pointee &+ Int64(n)
+        return n
+    }
+
+    /// 水位失控后重新居中到"最近的 frames 帧"。
+    ///
+    /// ⚠️ 必须用 `max(_, 0)` 兜底 —— 这是本轮顺带补上的边界缺陷：
+    /// 启动初期"写入总量还不到 frames"时（输出单元启动后的第一次回调就要 512 帧，
+    /// 而输入侧可能只填了几十帧），直接做减法会把**读游标推到 0 之前**（负数）。
+    /// 负游标不会崩（`& mask` 仍落在分配区内，读到的是初始化的 0），
+    /// 但 `fillFrames = write - read` 会虚高成 `write + |负数|`
+    /// ⇒ 水位统计与低水位收敛判断全部建立在错数上。
+    /// 这又是一次"看起来在跑、数值是假的"，因此宁可在这里显式夹住。
     @inline(__always) func resync(_ frames: Int) {
-        readIndex.pointee = writeIndex.pointee &- Int64(min(frames, capacity))
+        let target = Int64(min(frames, capacity))
+        readIndex.pointee = max(writeIndex.pointee &- target, 0)
     }
 }
