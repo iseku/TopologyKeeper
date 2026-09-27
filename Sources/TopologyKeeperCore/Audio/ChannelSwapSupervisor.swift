@@ -200,7 +200,22 @@ public final class ChannelSwapSupervisor: @unchecked Sendable {
             // ★ 用 needsAudioPath（= 引擎总开关）而不是 isEnabled：
             //   只开混音、乃至直通模式，通路同样要跑
             guard let self, self.settings.needsAudioPath else { return }
-            // 设备变化属于"新情况"，重置回退计数，给足重试机会
+            // ★ 设备事件属于"新情况"：**必须同时让挂起的退避任务失效**，
+            //   只重置计数是不够的。
+            //
+            //   真机 bug（2026-09-26 睡眠唤醒实测抓到）：`devicesChanged` /
+            //   `devicesDisappeared` 都会把 `attempt` 归零、却**不递增
+            //   `generation`**，于是每次设备事件都新起一条重试链，而旧链
+            //   照旧活着。1 秒后多条链同时醒来、**共享同一个 `attempt`
+            //   互相抢**，1-2-4-8 秒的序列被瞬间抢光：
+            //
+            //     12:48:20.254/.256/.259/.445  四条"第 1/4 次"（并发链）
+            //     12:48:21.319 → .323 → .326   三毫秒内推进到 2/4→3/4→4/4
+            //     12:48:21.489                 误报"已放弃"（实际设备 8 秒后才可用）
+            //
+            //   后果正是用户报过的"唤醒了但交换没回来"：状态停在 gaveUp，
+            //   除非再来一次设备事件。⇒ 失效判据与 `applyLocked` 同源。
+            self.generation &+= 1
             self.attempt = 0
             self.didNotifyGiveUp = false
             self.evaluateLocked(origin: .devicesChanged)
@@ -222,9 +237,58 @@ public final class ChannelSwapSupervisor: @unchecked Sendable {
             self._runningSettings = nil
             // 旧设备的短路统计随绑定一起作废（它描述的是"那条通路"的幂等情况）
             self._skippedByOrigin.removeAll()
+            // ★ 同 `devicesChanged`：设备销毁同样是"新情况"，
+            //   挂起的退避任务（可能来自更早一轮）必须一起失效，
+            //   否则多条链会共享同一个 `attempt` 互相抢（见那里的说明）。
+            self.generation &+= 1
             self.attempt = 0
             self.didNotifyGiveUp = false
             self.evaluateLocked(origin: .devicesDisappeared)
+        }
+    }
+
+    /// ★ 系统即将睡眠：**暂停**通路并释放设备。
+    ///
+    /// 与 `stop()` 的区别是**语义**（因此状态也不同）：
+    /// * `stop()` = 用户关掉了引擎（`.disabled`，UI 显示"未启用"）；
+    /// * 本方法 = 系统要睡了，我们主动让路（`.waiting(.sleeping)`，UI 显示"已暂停"）。
+    ///   唤醒后由 `onWake → devicesChanged()` 自动重新装配 —— 因为
+    ///   `stopAudioLocked()` 已经把 `_running*` 清空，幂等判据必然失败。
+    ///
+    /// ## 为什么必须做（2026-09-26 睡眠唤醒实测）
+    ///
+    /// 睡眠时**输出设备（HDMI）先消失，而输入侧（BlackHole）还会继续回调**。
+    /// 通路若仍在运行，就变成"只写不读"，水位一路涨：
+    ///
+    /// ```
+    /// 12:48:09.270  系统即将睡眠 / 12:48:09.321 显示器休眠
+    /// 12:48:10.164  HDMI 设备消失 → 输出回调停止
+    /// 12:48:10→19.9 通路仍在跑（通知被"睡眠中"策略跳过）⇒ 水位冲高
+    /// 12:48:29.654  重新装配后的读数：峰值 96ms（4608 帧）、丢旧 10372 帧、
+    ///               平均水位停在 923（目标 512，死区内无下沿控制 ⇒ 回不去）
+    /// ```
+    ///
+    /// 暂停后这段窗口**彻底不存在**：ring 随 `audio.stop()` 一起释放，
+    /// 没有水位可言；顺带把"恢复缓冲"的两次设备属性写从唤醒窗口挪到睡前
+    /// （实测它原本落在设备刚回来、还在协商的时刻）。
+    public func suspendForSleep() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            // 挂起的退避任务一律作废：睡眠期间它们醒来只会撞上"设备不存在"
+            self.generation &+= 1
+            self.attempt = 0
+            self.didNotifyGiveUp = false
+            guard self.settings.needsAudioPath else { return }
+            // 重复的睡眠信号不刷屏：已经处于"睡眠暂停"就不再记一行
+            let alreadyPaused = (self._state == .waiting(reason: .sleeping,
+                                                         attempt: 0, nextRetryInMs: 0))
+            let wasActive = !alreadyPaused && self._state != .disabled
+            self.stopAudioLocked()
+            self.setState(.waiting(reason: .sleeping, attempt: 0, nextRetryInMs: 0))
+            if wasActive {
+                Log.info("声道处理：系统即将睡眠 —— 已暂停通路并释放设备"
+                         + "（唤醒后自动重新装配）")
+            }
         }
     }
 
@@ -625,6 +689,13 @@ public final class ChannelSwapSupervisor: @unchecked Sendable {
                 averageFillMilliseconds: stats.averageFillMilliseconds,
                 sampleRate: stats.sampleRate,
                 starvedFrames: stats.starvedFrames,
+                // ★ 下沿微调与回调节拍一并上抛：
+                //   前者是"水位停在目标之上回不去"的解药是否生效的证据，
+                //   后者是给"水位为何冲高"归因的唯一手段（日志里一片空白时尤其重要）。
+                lowerTrimmedFrames: stats.lowerTrimmedFrames,
+                maxOutputGapMs: stats.maxOutputGapMs,
+                maxInputGapMs: stats.maxInputGapMs,
+                maxInputFrames: stats.maxInputFrames,
                 // ★ 功能感知：把"现在在跑哪个模式"与"混音实际接线"一并交给 UI。
                 //   不这样做的话，UI 只能用交换的措辞显示混音状态
                 //   （已确认的适配缺口：显示"交换中" + "恒等映射"）。

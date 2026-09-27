@@ -121,6 +121,13 @@ public enum ChannelSwapState: Equatable, Sendable {
         case outputChannelsTooFew(current: Int, required: Int)
         /// 设备列表为空（音频服务异常）
         case noDevices
+        /// ★ 系统即将睡眠，通路被我们**主动暂停**（既不是失败，也不是用户关闭）。
+        ///
+        /// 为什么需要它：睡眠时输出设备先消失、而输入侧还会继续回调，
+        /// 通路若仍在运行就变成"只写不读" ⇒ 水位冲高（真机实测峰值 96ms、
+        /// 丢旧 10372 帧）。暂停后这段窗口不存在，唤醒后自动重新装配。
+        /// 见 `ChannelSwapSupervisor.suspendForSleep()`。
+        case sleeping
 
         public var displayText: String {
             switch self {
@@ -132,6 +139,8 @@ public enum ChannelSwapState: Equatable, Sendable {
                 return "目标设备当前 \(current) 声道，需要 ≥\(required) 声道"
             case .noDevices:
                 return "未检测到音频设备"
+            case .sleeping:
+                return "系统睡眠中（唤醒后自动恢复）"
             }
         }
     }
@@ -152,6 +161,8 @@ public enum ChannelSwapState: Equatable, Sendable {
         case .starting:  return "正在启动…"
         case .running:   return "交换中"
         case .waiting(let reason, let attempt, let next):
+            // 睡眠暂停不是"重试等待"：没有"第 N 次"、也没有"N 秒后"可显示
+            if case .sleeping = reason { return "已暂停：\(reason.displayText)" }
             return "等待：\(reason.displayText)（第 \(attempt) 次重试，\(next / 1000) 秒后）"
         case .gaveUp(let reason, let attempts):
             return "已放弃：\(reason.displayText)（重试 \(attempts) 次）"
@@ -205,6 +216,20 @@ public protocol ChannelSwapEngineable: AnyObject, Sendable {
     /// （协议里没有可回落的方法），那正好是"静默失效"的写法。
     /// 唯一实现是 `ChannelSwapEngine`，让编译器强制每个实现都表态。
     func devicesDisappeared()
+
+    /// ★ 系统即将睡眠 —— 暂停通路并释放设备（**不是**"用户关闭"：状态是
+    /// `.waiting(.sleeping)`，而不是 `.disabled`）。
+    ///
+    /// 为什么必须做：睡眠时输出设备先消失、输入侧还在回调，通路继续跑就等于
+    /// "只写不读" ⇒ 水位一路涨（2026-09-26 真机实测峰值 96ms / 4608 帧、
+    /// 丢旧 10372 帧、平均水位停在 923 而目标是 512）。
+    ///
+    /// 唤醒侧不需要对应方法：既有 `devicesChanged()` 会触发重新评估，
+    /// 而暂停时已清空运行绑定 ⇒ 幂等判据必然失败 ⇒ 自动重新装配。
+    ///
+    /// ⚠️ 与 `devicesDisappeared()` 同理：**刻意不给默认实现** ——
+    /// 默认实现只能退化成"什么都不做"，那正是"静默失效"。
+    func suspendForSleep()
 }
 
 /// 诊断快照（值类型，便于跨线程传递与展示）
@@ -246,6 +271,13 @@ public struct ChannelSwapDiagnostics: Equatable, Sendable {
     public var sampleRate: Double
     /// 因数据不足被静音填充的帧数（丢音却看不见的那部分）
     public var starvedFrames: Int64
+    /// ★ 下沿微调丢掉的帧数（死区内被缓慢拉回目标的代价，与丢旧分开）
+    public var lowerTrimmedFrames: Int64
+    /// ★ 输出回调的最大间隔（毫秒）—— 给"水位冲高"归因：有洞 ⇒ 输出停摆
+    public var maxOutputGapMs: Double
+    /// ★ 输入回调的最大间隔（毫秒）与单次最大帧数 —— 与输出侧对照
+    public var maxInputGapMs: Double
+    public var maxInputFrames: Int
     /// 欠载重新居中次数
     public var resyncCount: Int64
     /// 目标水位（帧）
@@ -305,6 +337,10 @@ public struct ChannelSwapDiagnostics: Equatable, Sendable {
                 averageFillMilliseconds: Double = 0,
                 sampleRate: Double = 0,
                 starvedFrames: Int64 = 0,
+                lowerTrimmedFrames: Int64 = 0,
+                maxOutputGapMs: Double = 0,
+                maxInputGapMs: Double = 0,
+                maxInputFrames: Int = 0,
                 activeFunction: ChannelProcessingFunction = .off,
                 mixDescription: String? = nil,
                 skipStatistics: String? = nil) {
@@ -334,6 +370,10 @@ public struct ChannelSwapDiagnostics: Equatable, Sendable {
         self.averageFillMilliseconds = averageFillMilliseconds
         self.sampleRate = sampleRate
         self.starvedFrames = starvedFrames
+        self.lowerTrimmedFrames = lowerTrimmedFrames
+        self.maxOutputGapMs = maxOutputGapMs
+        self.maxInputGapMs = maxInputGapMs
+        self.maxInputFrames = maxInputFrames
         self.activeFunction = activeFunction
         self.mixDescription = mixDescription
         self.skipStatistics = skipStatistics
@@ -403,12 +443,16 @@ public struct ChannelSwapDiagnostics: Equatable, Sendable {
 
     /// 水位治理的"代价与事件"一行：丢旧帧数 + 欠载重置次数 + 峰值水位
     public var fillMaintenanceText: String {
-        ChannelSwapFillText.maintenance(fillFrames: fillFrames,
-                                        milliseconds: fillMilliseconds,
+        ChannelSwapFillText.maintenance(sampleRate: sampleRate,
                                         peakFillFrames: peakFillFrames,
                                         droppedStaleFrames: droppedStaleFrames,
                                         startupAlignedFrames: startupAlignedFrames,
                                         starvedFrames: starvedFrames,
-                                        resyncCount: resyncCount)
+                                        resyncCount: resyncCount,
+                                        targetFillFrames: targetFillFrames,
+                                        lowerTrimmedFrames: lowerTrimmedFrames,
+                                        maxOutputGapMs: maxOutputGapMs,
+                                        maxInputGapMs: maxInputGapMs,
+                                        maxInputFrames: maxInputFrames)
     }
 }

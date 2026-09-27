@@ -42,6 +42,22 @@ public final class RuleEngine: @unchecked Sendable {
     /// 本引擎**不认识**声道处理的任何类型（分层：Core 内部不反向依赖上层装配）。
     public var onChannelProcessingNeeded: (@Sendable (Bool) -> Void)?
 
+    /// ★ 系统**即将睡眠**：声道处理应当**暂停并释放设备**。
+    ///
+    /// 存在理由（2026-09-26 真机实测）：睡眠时输出设备（HDMI）先消失，
+    /// 而输入侧（BlackHole）仍会继续回调 —— 通路若继续跑就变成"只写不读"，
+    /// 水位一路涨（实测峰值 96ms / 4608 帧），唤醒后只能靠丢旧慢慢收敛
+    /// （实测丢旧 10372 帧、平均水位停在 923，目标 512 再也回不去）。
+    ///
+    /// ⚠️ 不能复用 `onChannelProcessingNeeded`：那个通知在**睡眠中一律被跳过**
+    ///    （见 `notifyChannelProcessingNeeded` 的门控 —— 那是刻意的：睡眠期间让
+    ///    消费方去装配只会撞上"设备不存在"并耗尽回退序列）。本回调要表达的恰恰
+    ///    是"睡眠期间**不要**跑通路"，语义相反，因此单列。
+    ///
+    /// 唤醒侧**不需要**新回调：`onWake` 既有的通知会让消费方重新评估，
+    /// 而暂停时已清空运行绑定 ⇒ 幂等判据必然失败 ⇒ 自动重新装配。
+    public var onChannelProcessingSuspended: (@Sendable () -> Void)?
+
     /// 上一轮报告时处于"已锁定"的规则。用于识别 `→ locked` 的**跃迁**，
     /// 避免"本来就锁着"的规则在每次兜底轮询里都重复通知（那些通知毫无信息量）。
     private var lastLockedRuleIDs: Set<UUID> = []
@@ -146,6 +162,12 @@ public final class RuleEngine: @unchecked Sendable {
         }
         sleepWake.onSleep = { [weak self] in
             guard let self else { return }
+            // ★ 睡眠第一件事：把声道处理**暂停**掉（释放 AUHAL 与 ring）。
+            //   必须在设备消失**之前**做 —— 睡眠时输出设备先没、输入侧还在回调，
+            //   通路多跑一会儿，水位就多涨一截（真机实测 96ms 冲高、丢旧 10372 帧）。
+            //   注意这里**不受** `notifyChannelProcessingNeeded` 的睡眠门控约束，
+            //   因为要表达的正是"睡眠期间别跑通路"。
+            self.onChannelProcessingSuspended?()
             // 睡眠期间不评估，但要把状态刷新成"挂起"，让 UI 显示正确
             self.policy.resetForNewSession()
             self.evaluateAll(trigger: .deviceEvent)

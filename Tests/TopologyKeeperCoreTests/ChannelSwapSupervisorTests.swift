@@ -719,4 +719,67 @@ struct ChannelSwapSupervisorTests {
         }
         #expect(attempt == 1 && next == 1000)
     }
+
+    // MARK: 睡眠暂停（2026-09-26 真机实测）
+
+    @Test("S2w 睡眠暂停：释放设备且状态是 .sleeping —— 绝不伪装成「用户关闭」")
+    func suspendForSleepPausesNotDisables() {
+        let q = makeQueue()
+        let audio = MockSwapAudio()
+        let sup = makeSupervisor(resolver: standardSwapTopology(), audio: audio,
+                                 scheduler: FakeScheduler(), queue: q, notified: ValueBox<String>(""))
+
+        sup.apply(enabledSettings); sync(q) {}
+        #expect(sup.state == .running)
+        let startsBefore = audio.startCount
+        let stopsBefore = audio.stopCount
+
+        sup.suspendForSleep(); sync(q) {}
+
+        #expect(audio.stopCount > stopsBefore,
+                "暂停必须真的释放设备 —— 否则睡眠期间只写不读，水位会一路涨")
+        #expect(sup.state == .waiting(reason: .sleeping, attempt: 0, nextRetryInMs: 0))
+        #expect(sup.state != .disabled, "睡眠暂停与「用户关闭引擎」是两件事，语义不能混")
+        // 文案也是行为的一部分：混成「第 0 次重试，0 秒后」会让用户以为出错了
+        #expect(sup.state.displayText == "已暂停：系统睡眠中（唤醒后自动恢复）")
+
+        // 唤醒：既有的设备事件路径必须能自动重新装配
+        // （暂停已清空运行绑定 ⇒ 幂等判据必然失败）
+        sup.devicesChanged(); sync(q) {}
+        #expect(sup.state == .running, "唤醒后应自动恢复运行")
+        #expect(audio.startCount == startsBefore + 1)
+    }
+
+    @Test("S2x 设备事件必须让挂起的退避链失效（否则多链抢光 attempt → 误报 gaveUp）")
+    func devicesChangedInvalidatesPendingRetries() {
+        // 真机 bug（2026-09-26 睡眠唤醒实测）：
+        //   12:48:20.254/.256/.259/.445  四条"第 1/4 次"（并发链）
+        //   12:48:21.319 → .323 → .326   三毫秒内推进到 2/4 → 3/4 → 4/4
+        //   12:48:21.489                 误报"已放弃"（设备 8 秒后才真正可用）
+        // 根因：`devicesChanged`/`devicesDisappeared` 只重置 `attempt`、
+        // 却不递增 `generation` ⇒ 旧链不失效 ⇒ 1 秒后同时醒来共享同一个
+        // `attempt` 互相抢。修复后每个设备事件都会让此前挂起的链失效。
+        let q = makeQueue()
+        let sched = FakeScheduler()
+        let sup = makeSupervisor(resolver: standardSwapTopology(outputChannels: 2),
+                                 audio: MockSwapAudio(),
+                                 scheduler: sched, queue: q, notified: ValueBox<String>(""))
+
+        sup.apply(enabledSettings); sync(q) {}
+        #expect(sup.retryAttempt == 1, "首次评估失败应安排第 1 次回退")
+
+        // 设备事件成簇（真机：唤醒瞬间连发多条）
+        for _ in 0..<3 { sup.devicesChanged(); sync(q) {} }
+        #expect(sup.retryAttempt == 1, "每个设备事件都会重置回退计数")
+
+        // 1 秒后所有链同时醒来
+        sched.fireAll(); sync(q) {}
+
+        if case .gaveUp = sup.state {
+            Issue.record("不应 gaveUp：设备只是暂时声道数不足，重试机会被并发链抢光了")
+        }
+        // 只有最新那条链生效 ⇒ 恰好推进一次
+        #expect(sup.retryAttempt == 2,
+                "应只有最新链推进（修复前会被 4 条链抢到 4 ⇒ 序列耗尽）")
+    }
 }

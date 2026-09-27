@@ -124,4 +124,34 @@ struct LatencyTargetTests {
         #expect(s.latencyDescription(minAchievableMs: nil) == "40ms")
         #expect(s.latencyDescription(minAchievableMs: 0) == "40ms")
     }
+
+    // MARK: 峰值毫秒的口径
+
+    @Test("峰值毫秒必须与瞬时水位无关（真机：水位低时面板显示「峰值 0ms」）")
+    func peakMillisecondsIsIndependentOfInstantFill() {
+        // 真机现场（2026-09-26）：水位漂到 287 帧时面板显示"水位峰值 0ms"，
+        // 而真实峰值是 6480 帧（135ms）—— 丢旧/对齐/微调三个计数一个都没清零，
+        // 就是"峰值帧数仍在、只是被算成了 0"的证据。
+        // 根因：文案借道**瞬时**水位做比例换算，而瞬时水位在一个回调内会掉到 0
+        // （刚读完、输入还没写进来），那一刻 `fillFrames > 0` 不成立 ⇒ 兜成 0ms。
+        // ⇒ 口径必须是「峰值帧数 ÷ 采样率」，与采集瞬间的水位无关。
+        let text = ChannelSwapFillText.maintenance(
+            sampleRate: 48000,
+            peakFillFrames: 6480,
+            droppedStaleFrames: 10860,
+            startupAlignedFrames: 2560,
+            starvedFrames: 0,
+            resyncCount: 0,
+            targetFillFrames: 512,
+            lowerTrimmedFrames: 404,
+            maxOutputGapMs: 123,
+            maxInputGapMs: 0,
+            maxInputFrames: 256)
+        #expect(text.contains("水位峰值 135ms"), "实际文案：\(text)")
+        // 异常项按约定追加（正常态不显示，免得把诊断行变成噪声）
+        #expect(text.contains("下沿微调 404 帧"), "实际文案：\(text)")
+        #expect(text.contains("输出间隔峰值 123ms"), "实际文案：\(text)")
+        // 输入块恰好等于名义值（目标 ÷ 2 = 256）⇒ 不该报"输入最大块"
+        #expect(!text.contains("输入最大块"), "实际文案：\(text)")
+    }
 }

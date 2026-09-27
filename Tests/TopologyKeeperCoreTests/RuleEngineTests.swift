@@ -193,6 +193,27 @@ struct SleepSuppressionTests {
         harness.emit(.nominalRateChanged(uid: "TEST-UID", deviceID: 100))
         #expect(harness.service.setPhysicalFormatCalls.count == callsBefore)
     }
+
+    @Test("T7d 系统即将睡眠时通知声道处理「暂停」（真机水位冲高窗口的解药）")
+    func notifiesChannelProcessingToSuspendOnSleep() {
+        // 2026-09-26 真机实测：睡眠时输出设备（HDMI）先消失、输入侧还在回调，
+        // 通路若继续跑就变成"只写不读" —— 水位冲高到 96ms、丢旧 10372 帧。
+        // ⇒ 睡眠必须**主动**通知声道处理暂停，且这条通知不受"睡眠中跳过"门控影响
+        //   （那个门控针对的是"重新装配"类通知，语义相反）。
+        let harness = EngineHarness()
+        harness.setupStandardDevice()
+        harness.start()
+
+        let suspends = ValueBox<Int>(0)
+        harness.engine.onChannelProcessingSuspended = { suspends.value += 1 }
+
+        harness.onQueue { harness.sleepWake.simulateSleep() }
+        #expect(suspends.value == 1,
+                "睡眠必须通知声道处理暂停（否则睡眠期只写不读，水位会一路涨）")
+
+        harness.onQueue { harness.sleepWake.simulateWake() }
+        #expect(suspends.value == 1, "唤醒不应重复触发暂停（恢复走既有的设备变化路径）")
+    }
 }
 
 // MARK: - T8 自身写入抑制窗口

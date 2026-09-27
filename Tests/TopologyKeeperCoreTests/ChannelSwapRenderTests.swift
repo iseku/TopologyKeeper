@@ -240,6 +240,7 @@ struct ChannelSwapRenderTests {
     ///   回归锁里唯一能拦住那次真机静音的一环。
     @Test("直通配置驱动整段正常分支：dst 必须被写满 —— 调用点回归锁")
     func renderFromRingPassThrough() {
+        var lowerTrim = 0   // 下沿微调节拍（跨回调保持）
         let frames = 512, stride = 8, usable = 8
         let ring = SwapRingBuffer(capacity: 4096, channels: 8)
         _ = write(ring, channels: 8, from: 0, count: frames * 2)
@@ -252,7 +253,7 @@ struct ChannelSwapRenderTests {
         let read = ChannelSwapAudioDriver.renderFromRing(
             ring: ring, dst: dst, stride: stride, usable: usable, frames: frames,
             permute: identityPermute, mix: .off,
-            targetFillFrames: 1024, deadbandFrames: 2048, isFirstOutputCallback: false, averageFillFrames: &averageFill, prefillAttempts: &prefillDisabled, counters: &counters)
+            targetFillFrames: 1024, deadbandFrames: 2048, isFirstOutputCallback: false, averageFillFrames: &averageFill, prefillAttempts: &prefillDisabled, lowerTrimCounter: &lowerTrim, counters: &counters)
 
         #expect(read == frames)
         let problem = check(dst, frames: frames, stride: stride, usable: usable,
@@ -264,6 +265,7 @@ struct ChannelSwapRenderTests {
 
     @Test("低水位收敛：超上限时丢**最旧**数据（不是丢新块）")
     func staleDropTakesOldestFrames() {
+        var lowerTrim = 0   // 下沿微调节拍（跨回调保持）
         let frames = 512, stride = 8, usable = 8
         let ring = SwapRingBuffer(capacity: 4096, channels: 8)
         _ = write(ring, channels: 8, from: 0, count: 3000)
@@ -277,7 +279,7 @@ struct ChannelSwapRenderTests {
         let read = ChannelSwapAudioDriver.renderFromRing(
             ring: ring, dst: dst, stride: stride, usable: usable, frames: frames,
             permute: identityPermute, mix: .off,
-            targetFillFrames: 1000, deadbandFrames: 1000, isFirstOutputCallback: false, averageFillFrames: &averageFill, prefillAttempts: &prefillDisabled, counters: &counters)
+            targetFillFrames: 1000, deadbandFrames: 1000, isFirstOutputCallback: false, averageFillFrames: &averageFill, prefillAttempts: &prefillDisabled, lowerTrimCounter: &lowerTrim, counters: &counters)
 
         #expect(counters.droppedStaleFrames == 250)
         #expect(read == frames)
@@ -288,6 +290,7 @@ struct ChannelSwapRenderTests {
 
     @Test("水位在死区内绝不丢数据（否则会追着噪声调）")
     func noDropInsideDeadband() {
+        var lowerTrim = 0   // 下沿微调节拍（跨回调保持）
         let frames = 256, stride = 8
         let ring = SwapRingBuffer(capacity: 4096, channels: 8)
         _ = write(ring, channels: 8, from: 0, count: 2000)
@@ -300,13 +303,14 @@ struct ChannelSwapRenderTests {
         _ = ChannelSwapAudioDriver.renderFromRing(
             ring: ring, dst: dst, stride: stride, usable: stride, frames: frames,
             permute: identityPermute, mix: .off,
-            targetFillFrames: 1900, deadbandFrames: 100, isFirstOutputCallback: false, averageFillFrames: &averageFill, prefillAttempts: &prefillDisabled, counters: &counters)
+            targetFillFrames: 1900, deadbandFrames: 100, isFirstOutputCallback: false, averageFillFrames: &averageFill, prefillAttempts: &prefillDisabled, lowerTrimCounter: &lowerTrim, counters: &counters)
 
         #expect(counters.droppedStaleFrames == 0, "水位恰好等于上限时属于死区，不得动作")
     }
 
     @Test("欠载且数据不足一个回调：读游标不得为负、水位不得虚高")
     func resyncNeverGoesNegative() {
+        var lowerTrim = 0   // 下沿微调节拍（跨回调保持）
         let frames = 512, stride = 8
         let ring = SwapRingBuffer(capacity: 4096, channels: 8)
         _ = write(ring, channels: 8, from: 0, count: 100)     // 远少于一个回调
@@ -319,7 +323,7 @@ struct ChannelSwapRenderTests {
         let read = ChannelSwapAudioDriver.renderFromRing(
             ring: ring, dst: dst, stride: stride, usable: stride, frames: frames,
             permute: identityPermute, mix: .off,
-            targetFillFrames: 1024, deadbandFrames: 2048, isFirstOutputCallback: false, averageFillFrames: &averageFill, prefillAttempts: &prefillDisabled, counters: &counters)
+            targetFillFrames: 1024, deadbandFrames: 2048, isFirstOutputCallback: false, averageFillFrames: &averageFill, prefillAttempts: &prefillDisabled, lowerTrimCounter: &lowerTrim, counters: &counters)
 
         #expect(counters.underruns == 1)
         #expect(counters.resyncs == 1)
@@ -332,6 +336,7 @@ struct ChannelSwapRenderTests {
 
     @Test("读游标落在平面末尾不足一个回调时，必须消费满一个回调（不得截断 ⇒ 不得周期性静音）")
     func readIsNotTruncatedAtRingTail() {
+        var lowerTrim = 0   // 下沿微调节拍（跨回调保持）
         let channels = 8, capacity = 4096, frames = 480
         let stride = 8
         let ring = SwapRingBuffer(capacity: capacity, channels: channels)
@@ -350,7 +355,7 @@ struct ChannelSwapRenderTests {
             let read = ChannelSwapAudioDriver.renderFromRing(
                 ring: ring, dst: dst, stride: stride, usable: stride, frames: frames,
                 permute: identityPermute, mix: .off,
-                targetFillFrames: 100_000, deadbandFrames: 100_000, isFirstOutputCallback: false, averageFillFrames: &averageFill, prefillAttempts: &prefillDisabled, counters: &counters)
+                targetFillFrames: 100_000, deadbandFrames: 100_000, isFirstOutputCallback: false, averageFillFrames: &averageFill, prefillAttempts: &prefillDisabled, lowerTrimCounter: &lowerTrim, counters: &counters)
             if read != frames {
                 truncatedAt = round
                 problem = "第 \(round) 轮回调只消费了 \(read) 帧（应为 \(frames)）—— 读游标在平面末尾被截断"
@@ -370,6 +375,7 @@ struct ChannelSwapRenderTests {
 
     @Test("数据不足时必须计入「静音填充」帧数（水位偏浅的真实损伤不能隐形）")
     func starvationIsCounted() {
+        var lowerTrim = 0   // 下沿微调节拍（跨回调保持）
         let frames = 512, stride = 8
         let ring = SwapRingBuffer(capacity: 4096, channels: 8)
         _ = write(ring, channels: 8, from: 0, count: 300)     // 比一个回调少 212 帧
@@ -383,7 +389,7 @@ struct ChannelSwapRenderTests {
             ring: ring, dst: dst, stride: stride, usable: stride, frames: frames,
             permute: identityPermute, mix: .off,
             targetFillFrames: 200_000, deadbandFrames: 100_000,
-            isFirstOutputCallback: false, averageFillFrames: &averageFill, prefillAttempts: &prefillDisabled, counters: &counters)
+            isFirstOutputCallback: false, averageFillFrames: &averageFill, prefillAttempts: &prefillDisabled, lowerTrimCounter: &lowerTrim, counters: &counters)
 
         #expect(read == 300, "只有 300 帧可读")
         // ★ 缺口 212 帧被 memset 成 0（音频里一段空洞）—— 必须计数。
@@ -395,6 +401,7 @@ struct ChannelSwapRenderTests {
 
     @Test("连一帧数据都没有时的**整块**静音也必须计数（否则丢音会隐形）")
     func wholeBlockStarvationIsCounted() {
+        var lowerTrim = 0   // 下沿微调节拍（跨回调保持）
         let frames = 512, stride = 8
         let ring = SwapRingBuffer(capacity: 4096, channels: 8)   // 一帧都没写
         let dst = makeSentinelBuffer(frames: frames, stride: stride)
@@ -407,7 +414,7 @@ struct ChannelSwapRenderTests {
             ring: ring, dst: dst, stride: stride, usable: stride, frames: frames,
             permute: identityPermute, mix: .off,
             targetFillFrames: 1024, deadbandFrames: 512,
-            isFirstOutputCallback: false, averageFillFrames: &averageFill, prefillAttempts: &prefillDisabled, counters: &counters)
+            isFirstOutputCallback: false, averageFillFrames: &averageFill, prefillAttempts: &prefillDisabled, lowerTrimCounter: &lowerTrim, counters: &counters)
 
         #expect(read == 0)
         // ★ 真机 192kHz 下出现过"欠载重置 4 次 + 静音填充 0 帧"这种自相矛盾的读数：
@@ -419,6 +426,7 @@ struct ChannelSwapRenderTests {
 
     @Test("启动预填充：水位不足目标时静音等待且**不消费**（让延迟变成确定的）")
     func prefillWaitsUntilTargetReached() {
+        var lowerTrim = 0   // 下沿微调节拍（跨回调保持）
         let frames = 512, stride = 8
         let ring = SwapRingBuffer(capacity: 4096, channels: 8)
         let dst = makeSentinelBuffer(frames: frames, stride: stride)
@@ -435,7 +443,7 @@ struct ChannelSwapRenderTests {
             permute: identityPermute, mix: .off,
             targetFillFrames: target, deadbandFrames: 512,
             isFirstOutputCallback: false, averageFillFrames: &averageFill,
-            prefillAttempts: &prefill, counters: &counters)
+            prefillAttempts: &prefill, lowerTrimCounter: &lowerTrim, counters: &counters)
         #expect(read1 == 0, "预填充期间不得消费")
         #expect(ring.fillFrames == 300, "水位必须原样保留才能积累")
         #expect(dst[0] == 0 && dst[stride] == 0, "预填充输出静音（不是未初始化内存）")
@@ -449,13 +457,14 @@ struct ChannelSwapRenderTests {
             permute: identityPermute, mix: .off,
             targetFillFrames: target, deadbandFrames: 512,
             isFirstOutputCallback: false, averageFillFrames: &averageFill,
-            prefillAttempts: &prefill, counters: &counters)
+            prefillAttempts: &prefill, lowerTrimCounter: &lowerTrim, counters: &counters)
         #expect(read2 == frames, "达标后应正常消费一个回调")
         #expect(prefill == -1, "预填充应已结束")
     }
 
     @Test("预填充超时兜底：永远填不满时也必须开跑（不得把链路永久静音）")
     func prefillTimesOutInsteadOfSilencingForever() {
+        var lowerTrim = 0   // 下沿微调节拍（跨回调保持）
         let frames = 512, stride = 8
         let ring = SwapRingBuffer(capacity: 4096, channels: 8)
         let dst = makeSentinelBuffer(frames: frames, stride: stride)
@@ -473,7 +482,7 @@ struct ChannelSwapRenderTests {
                 permute: identityPermute, mix: .off,
                 targetFillFrames: 100_000, deadbandFrames: 50_000,
                 isFirstOutputCallback: false, averageFillFrames: &averageFill,
-                prefillAttempts: &prefill, counters: &counters)
+                prefillAttempts: &prefill, lowerTrimCounter: &lowerTrim, counters: &counters)
         }
         #expect(prefill == -1, "必须在有限次回调内放弃等待")
         #expect(readTotal > 0, "超时后必须开始消费，否则就是永久静音")
@@ -481,6 +490,7 @@ struct ChannelSwapRenderTests {
 
     @Test("平均水位收敛到实际水位：诊断显示的是它，而不是一个回调内的锯齿")
     func averageConvergesToActualFill() {
+        var lowerTrim = 0   // 下沿微调节拍（跨回调保持）
         let frames = 512, stride = 8
         let ring = SwapRingBuffer(capacity: 4096, channels: 8)
         _ = write(ring, channels: 8, from: 0, count: frames)     // 初始水位 = 1 个回调
@@ -499,7 +509,7 @@ struct ChannelSwapRenderTests {
                 ring: ring, dst: dst, stride: stride, usable: stride, frames: frames,
                 permute: identityPermute, mix: .off,
                 targetFillFrames: 100_000, deadbandFrames: 100_000,
-                isFirstOutputCallback: false, averageFillFrames: &averageFill, prefillAttempts: &prefillDisabled, counters: &counters)
+                isFirstOutputCallback: false, averageFillFrames: &averageFill, prefillAttempts: &prefillDisabled, lowerTrimCounter: &lowerTrim, counters: &counters)
         }
         // 一阶低通收敛到观测点（写后、读前）的水位 1024。
         // ⚠️ 容差取 divisor/2 + 1：低通用四舍五入，**直接截断会永远差最多 divisor-1 帧**
@@ -586,6 +596,7 @@ struct ChannelSwapRenderTests {
 
     @Test("架构守护：正常分支的搬运调用不得被任何功能开关包裹（v0.1.3 回归形态）")
     func renderCallIsNotGatedByFeatureSwitch() throws {
+        var lowerTrim = 0   // 下沿微调节拍（跨回调保持）
         let text = try String(contentsOfFile: Self.driverSourcePath(), encoding: .utf8)
 
         // ① 调用点唯一：正常分支只有一处搬运入口（混音与交换共用）
@@ -628,5 +639,90 @@ struct ChannelSwapRenderTests {
                 "搬运调用被 `\(lastLine)` 包住了 —— 交换/直通会整段跳过")
         #expect(!lastLine.hasSuffix("{"),
                 "搬运调用被包进了一个块（上一行 `\(lastLine)`）")
+    }
+
+    // MARK: - 下沿微调（真机：水位停在死区内就再也回不去）
+
+    @Test("水位停在死区内时必须被缓慢拉回目标（真机实测停在 881 且丢旧不再增长）")
+    func lowerTrimPullsFillBackToTarget() {
+        // 真机现场（2026-09-26 两次独立复现）：
+        //   目标 512、死区 384，水位因冲高落在 881 / 923 —— 既没超过丢旧阈值
+        //   （严格大于 目标+死区 = 896 才丢），又不等于目标，于是**永远不动**，
+        //   只能"关掉再打开引擎"才重置。本用例锁住新行为：
+        //   死区内每 `lowerTrimInterval` 个回调丢 1 帧，水位必须单向回到目标。
+        let frames = 512
+        let target = 1024
+        let deadband = 512                     // 阈值 1536；测试水位停在 1324（死区内）
+        let ring = SwapRingBuffer(capacity: 8192, channels: 8)
+        let dst = makeSentinelBuffer(frames: frames, stride: 8)
+        defer { dst.deallocate() }
+
+        var averageFill = 0
+        var prefill = -1
+        var lowerTrim = 0
+        var counters = ChannelSwapAudioDriver.RenderCounters()
+
+        var seq = 0
+        _ = write(ring, channels: 8, from: seq, count: target + 300)
+        seq += target + 300
+
+        var rounds = 0
+        while rounds < 3000, ring.fillFrames > target {
+            // ★ 顺序必须是「先渲染、后补写」：`renderFromRing` 在**入口**采样水位，
+            //   而真实稳态里那个采样点就是"刚写完、还没读"的时刻（水位最高点）。
+            //   若先补写再渲染，采样点会凭空高出 `frames` 帧，把一次正常收敛
+            //   误判成超过丢旧阈值（第一版测试就是这么写错的）。
+            _ = ChannelSwapAudioDriver.renderFromRing(
+                ring: ring, dst: dst, stride: 8, usable: 8, frames: frames,
+                permute: identityPermute, mix: .off,
+                targetFillFrames: target, deadbandFrames: deadband,
+                isFirstOutputCallback: false,
+                averageFillFrames: &averageFill, prefillAttempts: &prefill,
+                lowerTrimCounter: &lowerTrim, counters: &counters)
+            // 补回本次读走的量 ⇒ 水位回到"两端节拍平衡"的原位，
+            // 于是每轮唯一的净变化就是下沿微调丢掉的那一两帧。
+            _ = write(ring, channels: 8, from: seq, count: frames)
+            seq += frames
+            rounds += 1
+        }
+
+        #expect(counters.droppedStaleFrames == 0,
+                "水位从未超过 目标+死区 ⇒ 丢旧不该动手（真机上水位卡住正是因为它不动手）")
+        #expect(counters.lowerTrimmedFrames > 0, "拉回必须由下沿微调完成，且必须计数可见")
+        #expect(ring.fillFrames <= target, "水位必须回到目标，实际 \(ring.fillFrames)")
+        #expect(rounds > 300,
+                "必须分很多轮回调缓慢拉回（一次跳变会听得出来），实际 \(rounds) 轮")
+    }
+
+    @Test("水位低于目标时下沿微调必须完全不动手（不得与欠载兜底打架）")
+    func lowerTrimDoesNothingBelowTarget() {
+        let frames = 512
+        let target = 1024
+        let ring = SwapRingBuffer(capacity: 8192, channels: 8)
+        let dst = makeSentinelBuffer(frames: frames, stride: 8)
+        defer { dst.deallocate() }
+
+        var averageFill = 0
+        var prefill = -1
+        var lowerTrim = 0
+        var counters = ChannelSwapAudioDriver.RenderCounters()
+
+        var seq = 0
+        // 水位刻意低于目标（真机正常态 481 < 512 就是这种形态）。
+        // ⚠️ 只写这一次：`renderFromRing` 在入口采样，若再多写一个回调的量，
+        //    采样点就会越过目标，测的就不是"低于目标"了。
+        _ = write(ring, channels: 8, from: seq, count: target - 200)
+        seq += target - 200
+
+        _ = ChannelSwapAudioDriver.renderFromRing(
+            ring: ring, dst: dst, stride: 8, usable: 8, frames: frames,
+            permute: identityPermute, mix: .off,
+            targetFillFrames: target, deadbandFrames: 512,
+            isFirstOutputCallback: false,
+            averageFillFrames: &averageFill, prefillAttempts: &prefill,
+            lowerTrimCounter: &lowerTrim, counters: &counters)
+
+        #expect(counters.lowerTrimmedFrames == 0, "低于目标时下沿微调不得动手")
+        #expect(counters.droppedStaleFrames == 0)
     }
 }

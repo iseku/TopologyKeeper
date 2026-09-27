@@ -57,4 +57,11 @@ public final class ChannelSwapEngine: ChannelSwapEngineable, @unchecked Sendable
     ///
     /// 依据：`AudioDeviceID` 每次重建都会变，绑定它的 AUHAL 单元随之失效。
     public func devicesDisappeared() { supervisor.devicesDisappeared() }
+
+    /// ★ 系统即将睡眠 —— 暂停通路并释放设备（**不是**"用户关闭"，状态是 `.sleeping`）。
+    ///
+    /// 睡眠时输出设备先消失、输入侧还在回调，通路继续跑就等于"只写不读"，
+    /// 水位会一路涨（真机实测峰值 96ms、丢旧 10372 帧、平均水位停在 923）。
+    /// 唤醒后由既有的 `devicesChanged()` 路径自动重新装配。
+    public func suspendForSleep() { supervisor.suspendForSleep() }
 }

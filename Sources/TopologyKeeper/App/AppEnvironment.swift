@@ -100,6 +100,14 @@ final class AppEnvironment: @unchecked Sendable {
                 swapTarget.devicesChanged()
             }
         }
+        // ★ 系统即将睡眠 → 暂停通路并释放设备（不是"用户关闭"，状态用 .sleeping）。
+        //   这是 2026-09-26 真机实测抓到的水位冲高窗口的解药：睡眠时输出设备先消失、
+        //   输入侧还在回调，通路继续跑就等于"只写不读"（实测峰值 96ms / 丢旧 10372 帧）。
+        //   唤醒不需要对应回调：onWake 既有的通知会触发重新评估，而暂停时已清空
+        //   运行绑定 ⇒ 幂等判据必然失败 ⇒ 自动重新装配。
+        engine.onChannelProcessingSuspended = {
+            swapTarget.suspendForSleep()
+        }
         audioQueue.async { [engine] in
             engine.start()
         }

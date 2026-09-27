@@ -1,6 +1,7 @@
 import AudioToolbox
 import AudioUnit
 import CoreAudio
+import Dispatch
 import Foundation
 
 /// 声道交换的**音频数据通路**（真实实现）。
@@ -71,6 +72,18 @@ public final class ChannelSwapAudioDriver: ChannelSwapAudioDriving, @unchecked S
     /// 水位收敛的比例分母：每次回调最多丢掉"超出量"的 1/8。
     /// 越大越平滑、收敛越慢；用比例而非一步到位，是为了不产生可听的跳变。
     static let fillConvergenceDivisor = 8
+
+    /// ★ 下沿微调的节拍：水位落在死区内时，**每这么多个回调丢 1 帧**。
+    ///
+    /// 为什么必须有（真机实测）：死区 `[目标, 目标+死区]` 内**没有任何控制** ——
+    /// 丢旧只在超过上限时动手，欠载 resync 只在下限兜底。于是水位一旦因冲高
+    /// 落进这个区间就**永远回不到目标**：实测睡眠唤醒后停在 881（目标 512，
+    /// 差 369 帧 ≈ 7.7ms），再也不会自己下来，只能"关掉再打开引擎"才重置。
+    ///
+    /// 速率：48kHz / 256 帧回调下，每 4 个回调丢 1 帧 ≈ 47 帧/秒 ≈ 0.1%
+    /// 速率差（约 1.7 音分），人耳不可闻；从 881 回到 512 约 8 秒。
+    /// 单帧丢弃不会产生可听跳变 —— 对比：丢旧一次可能丢几百帧。
+    static let lowerTrimInterval = 4
 
     // MARK: 单元与缓冲
 
@@ -203,6 +216,32 @@ public final class ChannelSwapAudioDriver: ChannelSwapAudioDriving, @unchecked S
     /// （那个只在 `< frames/2` 时计数）也不触发 `resync` ⇒ **丢音却看不见**。
     /// 真机观察到"水位长期贴地在 0/512 之间跳"时，必须靠这个数字判断有没有真损伤。
     private var sStarvedFrames: Int64 = 0
+
+    // MARK: 回调节拍诊断（给"水位冲高"归因）
+
+    /// 上一次回调的单调时刻（纳秒；**0 = 未初始化**）。
+    ///
+    /// 为什么用 0 作哨兵：装配之间（睡眠、停止、重建）会隔很久，
+    /// 若不重置，唤醒后第一个回调就会把"睡眠时长"记成一次回调间隔峰值 ——
+    /// 那会立刻污染诊断，把一次正常的 5ms 节拍显示成几十秒的洞。
+    /// ⇒ `stop()` 里必须清零（装配必然先 stop）。
+    private var sLastInputTick: UInt64 = 0
+    private var sLastOutputTick: UInt64 = 0
+    /// 回调间隔峰值（毫秒）—— 见 `ChannelSwapAudioStats.maxOutputGapMs`。
+    ///
+    /// 真机实测：装配**之后**水位会从 512 冲到 5616（117ms），而那段时间
+    /// **没有任何设备事件**（日志一片空白）。这类"看不见的空洞"只能靠节拍量：
+    /// 输出侧有洞 ⇒ 输出停摆、输入空写；输入侧块变大 ⇒ 输入追赶。
+    private var sMaxInputGapMs: Double = 0
+    private var sMaxOutputGapMs: Double = 0
+    /// 单次输入回调的最大帧数（正常 = 设备缓冲帧数）
+    private var sMaxInputFrames = 0
+
+    /// 下沿微调的节拍计数（每 `lowerTrimInterval` 个回调丢 1 帧，见 `renderFromRing`）
+    private var sLowerTrimCounter = 0
+    /// 下沿微调累计丢掉的帧数（与 `sDroppedStaleFrames` 分开计数）
+    private var sLowerTrimmedFrames: Int64 = 0
+
     /// 每路输出的峰值（实时回调里就地取 abs 最大值，无分配）。
     ///
     /// ⚠️ **必须固定容量、只改元素**。曾经写成"按需 `sChannelPeaks = [Float](...)` 重新分配"，
@@ -406,6 +445,15 @@ public final class ChannelSwapAudioDriver: ChannelSwapAudioDriving, @unchecked S
         sPeakFillFrames = 0
         sAverageFillFrames = 0
         sStarvedFrames = 0
+        // ★ 回调节拍诊断与下沿微调也必须清零：
+        //   装配之间隔着睡眠/停止，不重置就会把"睡眠时长"记成回调间隔峰值。
+        sLastInputTick = 0
+        sLastOutputTick = 0
+        sMaxInputGapMs = 0
+        sMaxOutputGapMs = 0
+        sMaxInputFrames = 0
+        sLowerTrimCounter = 0
+        sLowerTrimmedFrames = 0
         sPrefillAttempts = -1
         targetFillFrames = 0
         fillDeadbandFrames = 0
@@ -455,7 +503,13 @@ public final class ChannelSwapAudioDriver: ChannelSwapAudioDriving, @unchecked S
                               averageFillMilliseconds: sampleRate > 0
                                   ? Double(sAverageFillFrames) / sampleRate * 1000 : 0,
                               sampleRate: sampleRate,
-                              starvedFrames: sStarvedFrames)
+                              starvedFrames: sStarvedFrames,
+                              // ★ 下沿微调与回调节拍：前者是"把水位拉回目标"的代价，
+                              //   后者是给"水位为何冲高"归因的唯一手段（见字段说明）。
+                              lowerTrimmedFrames: sLowerTrimmedFrames,
+                              maxOutputGapMs: sMaxOutputGapMs,
+                              maxInputGapMs: sMaxInputGapMs,
+                              maxInputFrames: sMaxInputFrames)
     }
 
     // MARK: - 预分配
@@ -668,9 +722,18 @@ public final class ChannelSwapAudioDriver: ChannelSwapAudioDriving, @unchecked S
     /// 输入回调：`AudioUnitRender` 取源数据 → 取前 N 声道 → 写入环形缓冲
     private func handleInput(frameCount: UInt32) -> OSStatus {
         sInCallbacks += 1
+        // ★ 回调节拍诊断（实时安全：读时钟 + 写整数，不加锁、不分配、不写日志）。
+        //   ⚠️ 绝不能用 `print`/`Log` 在这里输出 —— 见文件头的实时线程纪律。
+        let inTick = DispatchTime.now().uptimeNanoseconds
+        if sLastInputTick != 0 {
+            let gapMs = Double(inTick &- sLastInputTick) / 1_000_000
+            if gapMs > sMaxInputGapMs { sMaxInputGapMs = gapMs }
+        }
+        sLastInputTick = inTick
         guard let ring, let abl = renderABL else { return noErr }
 
         let frames = min(Int(frameCount), Self.maxFrames)
+        if frames > sMaxInputFrames { sMaxInputFrames = frames }
         guard frames > 0 else { return noErr }
 
         let list = UnsafeMutableAudioBufferListPointer(abl)
@@ -918,6 +981,8 @@ public final class ChannelSwapAudioDriver: ChannelSwapAudioDriving, @unchecked S
         var resyncs: Int64 = 0
         /// 为把水位拉回目标而丢弃的最旧帧数
         var droppedStaleFrames: Int64 = 0
+        /// ★ 下沿微调丢掉的帧数（死区内每 N 个回调丢 1 帧，与 `droppedStaleFrames` 分开）
+        var lowerTrimmedFrames: Int64 = 0
         /// 首次回调对齐水位时丢掉的启动积压（帧）
         var startupAlignedFrames: Int64 = 0
         /// 因数据不足被静音填充的帧数
@@ -959,6 +1024,7 @@ public final class ChannelSwapAudioDriver: ChannelSwapAudioDriving, @unchecked S
                                isFirstOutputCallback: Bool,
                                averageFillFrames: inout Int,
                                prefillAttempts: inout Int,
+                               lowerTrimCounter: inout Int,
                                counters: inout RenderCounters) -> Int {
         counters.peakFillFrames = max(counters.peakFillFrames, ring.fillFrames)
 
@@ -1020,6 +1086,31 @@ public final class ChannelSwapAudioDriver: ChannelSwapAudioDriving, @unchecked S
             if drop > 0 {
                 counters.droppedStaleFrames += Int64(ring.discardStale(drop))
             }
+        }
+
+        // ★★ 下沿微调：水位落在死区内时，**每 `lowerTrimInterval` 个回调丢 1 帧**。
+        //
+        //   为什么必须有：死区 `[目标, 目标+死区]` 内**没有任何控制** —— 丢旧只在
+        //   超过上限时动手，欠载 resync 只在下限兜底。于是水位一旦因冲高落进这个
+        //   区间，就**永远回不到目标**。真机实测（两次独立复现，2026-09-26）：
+        //     · 睡眠唤醒后停在 881 / 923（目标 512，差值 ≈ 7.7~9ms）；
+        //     · 此后丢旧不再增长，水位就是不动，只能"关掉再打开引擎"才重置。
+        //
+        //   速率"每 4 个回调丢 1 帧" ≈ 0.1% 速率差（约 1.7 音分）、约 8 秒回到目标：
+        //   既听不出来，也不会像丢旧那样一次跳几十上百帧。
+        //   超过死区仍交给丢旧（更快）；两者**互斥**，否则同一次回调会叠两次丢弃。
+        if targetFillFrames > 0,
+           fill > targetFillFrames,
+           fill <= targetFillFrames + deadbandFrames {
+            lowerTrimCounter += 1
+            if lowerTrimCounter >= Self.lowerTrimInterval {
+                lowerTrimCounter = 0
+                let trimmed = ring.discardStale(1)
+                if trimmed > 0 { counters.lowerTrimmedFrames += Int64(trimmed) }
+            }
+        } else {
+            // 水位不在死区内（偏低、或高到该走丢旧）→ 节拍重新开始
+            lowerTrimCounter = 0
         }
 
         // ⚠️⚠️ 可读总量必须取 `fillFrames`（= 写游标 − 读游标）。
@@ -1171,6 +1262,14 @@ public final class ChannelSwapAudioDriver: ChannelSwapAudioDriving, @unchecked S
     private func handleOutput(frameCount: UInt32,
                               ioData: UnsafeMutablePointer<AudioBufferList>?) -> OSStatus {
         sOutCallbacks += 1
+        // ★ 回调节拍诊断：输出侧的"洞"就是水位冲高的直接来源
+        //   （洞期间输入照写、输出不读 ⇒ 水位上涨）。
+        let outTick = DispatchTime.now().uptimeNanoseconds
+        if sLastOutputTick != 0 {
+            let gapMs = Double(outTick &- sLastOutputTick) / 1_000_000
+            if gapMs > sMaxOutputGapMs { sMaxOutputGapMs = gapMs }
+        }
+        sLastOutputTick = outTick
         guard let ring, let ioData else { return noErr }
         let frames = Int(frameCount)
 
@@ -1259,10 +1358,12 @@ public final class ChannelSwapAudioDriver: ChannelSwapAudioDriving, @unchecked S
                                       isFirstOutputCallback: isFirstOutputCallback,
                                       averageFillFrames: &sAverageFillFrames,
                                       prefillAttempts: &sPrefillAttempts,
+                                      lowerTrimCounter: &sLowerTrimCounter,
                                       counters: &counters)
         sUnderruns += counters.underruns
         sResyncs += counters.resyncs
         sDroppedStaleFrames += counters.droppedStaleFrames
+        sLowerTrimmedFrames += counters.lowerTrimmedFrames
         sStartupAlignedFrames += counters.startupAlignedFrames
         sStarvedFrames += counters.starvedFrames
         if counters.peakFillFrames > sPeakFillFrames { sPeakFillFrames = counters.peakFillFrames }

@@ -184,24 +184,57 @@ public enum ChannelSwapFillText {
     /// * 它**持续快速增长** → 两端时钟漂移偏大，靠丢数据换低延迟不划算，
     ///   该评估 PLL（用 BlackHole 的可调时钟做闭环），而不是继续丢；
     /// * `resyncCount` 增长 → 源慢于目标，属于事件性跳变，听感上可能有一次轻微顿挫。
-    public static func maintenance(fillFrames: Int, milliseconds: Double,
+    ///
+    /// ⚠️ 峰值的毫秒数**必须直接用采样率换算**，不要借道瞬时水位。
+    ///    曾经的写法是 `peakFillFrames * fillMilliseconds / fillFrames`（比例换算），
+    ///    数学上等价，却在 `fillFrames == 0` 时被兜成 0ms —— 而瞬时水位在一个
+    ///    回调内就会掉到 0（刚读完、输入还没写进来），水位越低越容易撞上。
+    ///    真机现场：水位掉到 287 帧后，面板显示"水位峰值 0ms"，
+    ///    而真实峰值是 6480 帧（135ms）—— 又一次"显示的与跑的不是一回事"。
+    public static func maintenance(sampleRate: Double,
                                    peakFillFrames: Int,
                                    droppedStaleFrames: Int64,
                                    startupAlignedFrames: Int64,
                                    starvedFrames: Int64,
-                                   resyncCount: Int64) -> String {
-        let peakMs = fillFrames > 0
-            ? Int((Double(peakFillFrames) * milliseconds / Double(fillFrames)).rounded())
+                                   resyncCount: Int64,
+                                   targetFillFrames: Int,
+                                   lowerTrimmedFrames: Int64,
+                                   maxOutputGapMs: Double,
+                                   maxInputGapMs: Double,
+                                   maxInputFrames: Int) -> String {
+        let peakMs = sampleRate > 0
+            ? Int((Double(peakFillFrames) / sampleRate * 1000).rounded())
             : 0
         // 「启动对齐」与「丢旧」分开显示：前者只在装配后第一拍出现一次
         // （HDMI 输出设备启动慢造成的积压），后者是运行期的治理代价。
         // 「静音填充」= 因数据不足被 memset 成 0 的帧数（水位偏浅的真实损伤）。
         // 它与 `underruns`/`resyncCount` 不同：水位在 [frames/2, frames) 时
         // 会持续产生静音却完全不计数 —— 所以必须单列，否则"丢音却看不见"。
-        return "水位峰值 \(peakMs)ms　丢旧 \(droppedStaleFrames) 帧"
+        var text = "水位峰值 \(peakMs)ms　丢旧 \(droppedStaleFrames) 帧"
             + "　启动对齐 \(startupAlignedFrames) 帧"
             + "　静音填充 \(starvedFrames) 帧　欠载重置 \(resyncCount) 次"
+        // ★ 以下三项**只在异常时追加**：正常态这一行保持原样 ——
+        //   诊断行一旦常驻无用信息，就会稀释真正要看的那几个数。
+        if lowerTrimmedFrames > 0 {
+            text += "　下沿微调 \(lowerTrimmedFrames) 帧"
+        }
+        if maxOutputGapMs >= gapAlertMs {
+            text += "　输出间隔峰值 \(Int(maxOutputGapMs.rounded()))ms"
+        }
+        // 名义回调帧数 = 目标水位 / 2（目标 = 2 × 回调，见 `resolveLatencyTarget`）
+        let nominalCallback = targetFillFrames / 2
+        if nominalCallback > 0, maxInputFrames > nominalCallback {
+            text += "　输入最大块 \(maxInputFrames) 帧"
+        }
+        if maxInputGapMs >= gapAlertMs {
+            text += "　输入间隔峰值 \(Int(maxInputGapMs.rounded()))ms"
+        }
+        return text
     }
+
+    /// 回调间隔超过它就值得报出来（正常回调间隔是 5.3ms @48k/256）。
+    /// 取 30ms：既高于任何正常调度抖动，又远低于真机看到的 ~100ms 空洞。
+    public static let gapAlertMs: Double = 30
 }
 
 /// 音频通路的实时统计
@@ -280,6 +313,28 @@ public struct ChannelSwapAudioStats: Equatable, Sendable {
     /// 欠载"重新居中"次数（每次都是一次事件性的数据跳变）。
     public var resyncCount: Int64
 
+    /// ★ **下沿微调**丢掉的帧数 —— 水位落在死区内、被缓慢拉回目标所丢的帧。
+    ///
+    /// 与 `droppedStaleFrames`（上限治理，一次丢几十到几百帧）**必须分开计数**：
+    /// 这里是每 N 个回调丢 1 帧的微调，速率约 0.1%（≈1.7 音分），人耳不可闻。
+    /// 混在一起会让"丢旧"看起来在异常增长，把一次正常收敛误读成漂移偏大。
+    public var lowerTrimmedFrames: Int64
+
+    /// ★ 输出回调的**最大间隔**（毫秒）—— 用于给"水位冲高"归因。
+    ///
+    /// 存在理由（真机实测）：装配**之后**水位仍会从 512 冲到 5616（117ms），
+    /// 而那段时间**没有任何设备事件**（日志一片空白），光看日志无法归因。
+    /// 这类"看不见的空洞"只能靠回调节拍量出来：
+    ///   · 输出间隔出现 ~100ms 的洞 ⇒ 输出侧停摆，输入侧在空写；
+    ///   · 输入间隔正常但单次帧数远超名义值 ⇒ 输入侧在"追赶"。
+    public var maxOutputGapMs: Double
+
+    /// 输入回调的最大间隔（毫秒）—— 与输出侧对照，区分"谁停摆了"。
+    public var maxInputGapMs: Double
+
+    /// 单次输入回调的**最大帧数** —— 输入突发时远大于名义回调帧数。
+    public var maxInputFrames: Int
+
     /// 目标水位（帧）—— 稳态期望值，诊断时用来判断"现在偏高还是偏低"。
     public var targetFillFrames: Int
 
@@ -307,7 +362,11 @@ public struct ChannelSwapAudioStats: Equatable, Sendable {
                 averageFillFrames: Int = 0,
                 averageFillMilliseconds: Double = 0,
                 sampleRate: Double = 0,
-                starvedFrames: Int64 = 0) {
+                starvedFrames: Int64 = 0,
+                lowerTrimmedFrames: Int64 = 0,
+                maxOutputGapMs: Double = 0,
+                maxInputGapMs: Double = 0,
+                maxInputFrames: Int = 0) {
         self.inputCallbackCount = inputCallbackCount
         self.outputCallbackCount = outputCallbackCount
         self.framesIn = framesIn
@@ -328,6 +387,10 @@ public struct ChannelSwapAudioStats: Equatable, Sendable {
         self.averageFillMilliseconds = averageFillMilliseconds
         self.sampleRate = sampleRate
         self.starvedFrames = starvedFrames
+        self.lowerTrimmedFrames = lowerTrimmedFrames
+        self.maxOutputGapMs = maxOutputGapMs
+        self.maxInputGapMs = maxInputGapMs
+        self.maxInputFrames = maxInputFrames
     }
 
     /// 延迟主行（文案与 UI 共用同一出处）—— 用**平均**水位，避免显示锯齿
@@ -339,12 +402,16 @@ public struct ChannelSwapAudioStats: Equatable, Sendable {
 
     /// 水位治理行（丢旧帧数 / 欠载重置 / 峰值水位）
     public var fillMaintenanceText: String {
-        ChannelSwapFillText.maintenance(fillFrames: fillFrames,
-                                        milliseconds: fillMilliseconds,
+        ChannelSwapFillText.maintenance(sampleRate: sampleRate,
                                         peakFillFrames: peakFillFrames,
                                         droppedStaleFrames: droppedStaleFrames,
                                         startupAlignedFrames: startupAlignedFrames,
                                         starvedFrames: starvedFrames,
-                                        resyncCount: resyncCount)
+                                        resyncCount: resyncCount,
+                                        targetFillFrames: targetFillFrames,
+                                        lowerTrimmedFrames: lowerTrimmedFrames,
+                                        maxOutputGapMs: maxOutputGapMs,
+                                        maxInputGapMs: maxInputGapMs,
+                                        maxInputFrames: maxInputFrames)
     }
 }
